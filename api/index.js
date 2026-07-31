@@ -8,7 +8,7 @@ const getJwtSecret = () => process.env.JWT_SECRET || 'REDACTED_JWT_SECRET';
 const getSupabaseUrl = () => (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
 const getSupabaseAnonKey = () => process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impwb25wZG1vanV4eGFlY3hncGd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NjM2NzAsImV4cCI6MjEwMTAzOTY3MH0.hZI2QRFxU7ZHQ4FnH2pLnqQBA6BSUX3bih3WQRh6za4';
 
-// Global Persistent Memory Store across Vercel invocations
+// Global Persistent Memory Store across Vercel serverless invocations
 const globalUsers = global._pulseroom_users || new Map();
 const globalConfirmedEmails = global._pulseroom_confirmed || new Set();
 const globalRooms = global._pulseroom_rooms || new Map();
@@ -41,6 +41,7 @@ function generateConfirmationToken(email) {
 }
 
 function verifyConfirmationToken(token) {
+  if (!token) return { valid: false, error: 'Confirmation token is required.' };
   try {
     const decoded = jwt.verify(token, getJwtSecret());
     if (decoded && decoded.purpose === 'confirm_email' && decoded.email) {
@@ -52,12 +53,13 @@ function verifyConfirmationToken(token) {
   }
 }
 
-// Universal Account Finder (Memory + Supabase REST API)
+// Universal Account Finder (Memory + Supabase REST API Cloud DB)
 async function findUserByEmail(email) {
+  if (!email) return null;
   const clean = email.trim().toLowerCase();
 
   for (const user of globalUsers.values()) {
-    if (user.email.toLowerCase() === clean) return user;
+    if (user.email && user.email.toLowerCase() === clean) return user;
   }
 
   try {
@@ -79,7 +81,9 @@ async function findUserByEmail(email) {
 }
 
 async function findUserById(id) {
+  if (!id) return null;
   if (globalUsers.has(id)) return globalUsers.get(id);
+
   try {
     const res = await fetch(`${getSupabaseUrl()}/rest/v1/users?id=eq.${encodeURIComponent(id)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -100,7 +104,7 @@ async function findUserById(id) {
 async function createUser({ username, email, passwordHash, avatarUrl, bio, emailConfirmed = false }) {
   const cleanEmail = email.trim().toLowerCase();
   const id = 'usr_' + Date.now() + '_' + Math.random().toString(36).substring(7);
-  const isConfirmed = emailConfirmed || globalConfirmedEmails.has(cleanEmail);
+  const isConfirmed = Boolean(emailConfirmed || globalConfirmedEmails.has(cleanEmail));
 
   const user = {
     id,
@@ -170,14 +174,36 @@ async function resetUserPassword(email, newPasswordHash) {
   return user;
 }
 
-// Dual-Engine Universal Email Dispatcher
+// Universal Multi-Provider Email Dispatcher
 async function sendEmail({ to, subject, htmlText, plainText }) {
-  const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  const gmailUser = (process.env.GMAIL_USER || '').trim();
-  const rawPass = (process.env.GMAIL_APP_PASS || '').trim();
+  const gmailUser = (process.env.GMAIL_USER || 'user@example.com').trim();
+  const rawPass = (process.env.GMAIL_APP_PASS || 'REDACTED_GMAIL_APP_PASSWORD').trim();
   const gmailPass = rawPass.replace(/\s+/g, '');
+  const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-  // 1. Try Resend API
+  // Priority 1: Direct Gmail SMTP Engine (Delivers to ANY Email Address)
+  if (gmailUser && gmailPass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: gmailUser, pass: gmailPass }
+      });
+
+      const info = await transporter.sendMail({
+        from: `"PulseRoom Messenger" <${gmailUser}>`,
+        to,
+        subject,
+        text: plainText,
+        html: htmlText
+      });
+
+      return { success: true, provider: 'gmail', messageId: info.messageId };
+    } catch (gErr) {
+      console.error('Gmail Direct SMTP Error:', gErr.message);
+    }
+  }
+
+  // Priority 2: Resend API
   if (resendKey) {
     try {
       const response = await fetch('https://api.resend.com/emails', {
@@ -203,29 +229,7 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // 2. Direct Gmail SMTP Backup
-  if (gmailUser && gmailPass) {
-    try {
-      const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: gmailUser, pass: gmailPass }
-      });
-
-      const info = await transporter.sendMail({
-        from: `"PulseRoom Messenger" <${gmailUser}>`,
-        to,
-        subject,
-        text: plainText,
-        html: htmlText
-      });
-
-      return { success: true, provider: 'gmail', messageId: info.messageId };
-    } catch (gErr) {
-      console.error('Gmail Direct SMTP Exception:', gErr.message);
-    }
-  }
-
-  return { success: false, error: 'No active mail dispatchers succeeded. Configure RESEND_API_KEY or GMAIL_USER/GMAIL_APP_PASS in Vercel environment.' };
+  return { success: false, error: 'Email dispatch failed. Please verify mail configuration.' };
 }
 
 // Express App
@@ -249,7 +253,6 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     app: 'PulseRoom Vercel Engine',
-    resendConfigured: Boolean(process.env.RESEND_API_KEY),
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
     usersCount: globalUsers.size,
     timestamp: new Date().toISOString()
@@ -304,12 +307,12 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (!sendRes.success) {
       return res.status(500).json({
-        error: sendRes.error || 'Account created, but we could not send the confirmation email right now. Please check mail settings.'
+        error: sendRes.error || 'Account created, but confirmation email could not be delivered.'
       });
     }
 
     return res.status(201).json({
-      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox!`,
+      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox to confirm before logging in!`,
       email: cleanEmail,
       sendResult: sendRes
     });
@@ -399,7 +402,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint
+// 4. Login Endpoint (With Persistent Account Sync & Confirmation Enforcement)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -513,7 +516,7 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. Rooms & Groups Endpoints
+// 7. Rooms & Groups Endpoints (Guaranteed Safe Room Opening)
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = Array.from(globalRooms.values()).filter(r =>
@@ -528,6 +531,8 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
 app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   try {
     const { targetUserId } = req.body || {};
+    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required.' });
+
     const me = await findUserById(req.user.id);
     const partner = await findUserById(targetUserId);
 
@@ -538,14 +543,15 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
       room = {
         id: roomId,
         type: 'private',
-        partner: partner ? { id: partner.id, username: partner.username, avatar_url: partner.avatar_url, bio: partner.bio } : null,
-        members: [{ id: me.id }, { id: partner.id }],
+        partner: partner ? { id: partner.id, username: partner.username, avatar_url: partner.avatar_url, bio: partner.bio } : { id: targetUserId, username: 'Partner' },
+        members: [{ id: req.user.id }, { id: targetUserId }],
         created_at: new Date().toISOString()
       };
       globalRooms.set(roomId, room);
     }
     return res.json(room);
   } catch (err) {
+    console.error('Initiate room error:', err);
     return res.status(500).json({ error: 'Failed to initiate room.' });
   }
 });
@@ -621,9 +627,9 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
     const message = {
       id: msgId,
       room_id: roomId,
-      sender_id: user.id,
-      username: user.username,
-      avatar_url: user.avatar_url,
+      sender_id: req.user.id,
+      username: user ? user.username : req.user.username || 'User',
+      avatar_url: user ? user.avatar_url : '',
       text,
       type: type || 'text',
       media_url: mediaUrl,
@@ -678,9 +684,9 @@ app.post('/api/statuses', authenticateToken, async (req, res) => {
 
     const status = {
       id,
-      user_id: user.id,
-      username: user.username,
-      avatar_url: user.avatar_url,
+      user_id: req.user.id,
+      username: user ? user.username : 'User',
+      avatar_url: user ? user.avatar_url : '',
       text,
       media_url: mediaUrl,
       media_type: mediaType || 'image',
@@ -727,7 +733,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         id: roomId,
         type: 'private',
         partner: { id: targetUser.id, username: targetUser.username, avatar_url: targetUser.avatar_url },
-        members: [{ id: me.id }, { id: targetUser.id }]
+        members: [{ id: req.user.id }, { id: targetUser.id }]
       };
       globalRooms.set(roomId, room);
 
