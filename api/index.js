@@ -8,15 +8,17 @@ const getJwtSecret = () => process.env.JWT_SECRET || 'pulseroom_super_secret_jwt
 const getSupabaseUrl = () => (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
 const getSupabaseAnonKey = () => process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impwb25wZG1vanV4eGFlY3hncGd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NjM2NzAsImV4cCI6MjEwMTAzOTY3MH0.hZI2QRFxU7ZHQ4FnH2pLnqQBA6BSUX3bih3WQRh6za4';
 
-// Global Persistent Memory Store across Vercel serverless invocations
+// Fail-Safe Global Account Vault across Vercel serverless function invocations
 const globalUsers = global._pulseroom_users || new Map();
 const globalConfirmedEmails = global._pulseroom_confirmed || new Set();
+const globalAccountStore = global._pulseroom_account_store || new Map();
 const globalRooms = global._pulseroom_rooms || new Map();
 const globalMessages = global._pulseroom_messages || new Map();
 const globalStatuses = global._pulseroom_statuses || new Map();
 
 global._pulseroom_users = globalUsers;
 global._pulseroom_confirmed = globalConfirmedEmails;
+global._pulseroom_account_store = globalAccountStore;
 global._pulseroom_rooms = globalRooms;
 global._pulseroom_messages = globalMessages;
 global._pulseroom_statuses = globalStatuses;
@@ -53,15 +55,24 @@ function verifyConfirmationToken(token) {
   }
 }
 
-// Universal Account Finder (Memory + Supabase REST API Cloud DB)
+// Resilient Account Finder (Memory + Global Vault + Supabase REST API)
 async function findUserByEmail(email) {
   if (!email) return null;
   const clean = email.trim().toLowerCase();
 
+  // 1. Check active memory
   for (const user of globalUsers.values()) {
     if (user.email && user.email.toLowerCase() === clean) return user;
   }
 
+  // 2. Check global persistent store
+  if (globalAccountStore.has(clean)) {
+    const user = globalAccountStore.get(clean);
+    globalUsers.set(user.id, user);
+    return user;
+  }
+
+  // 3. Query Supabase REST API
   try {
     const res = await fetch(`${getSupabaseUrl()}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -70,11 +81,12 @@ async function findUserByEmail(email) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
         globalUsers.set(data[0].id, data[0]);
+        globalAccountStore.set(clean, data[0]);
         return data[0];
       }
     }
   } catch (e) {
-    console.warn('Supabase query error:', e.message);
+    console.warn('Supabase query warning:', e.message);
   }
 
   return null;
@@ -84,6 +96,10 @@ async function findUserById(id) {
   if (!id) return null;
   if (globalUsers.has(id)) return globalUsers.get(id);
 
+  for (const user of globalAccountStore.values()) {
+    if (user.id === id) return user;
+  }
+
   try {
     const res = await fetch(`${getSupabaseUrl()}/rest/v1/users?id=eq.${encodeURIComponent(id)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -92,12 +108,14 @@ async function findUserById(id) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
         globalUsers.set(data[0].id, data[0]);
+        globalAccountStore.set(data[0].email.toLowerCase(), data[0]);
         return data[0];
       }
     }
   } catch (e) {
-    console.warn('Supabase findById error:', e.message);
+    console.warn('Supabase findById warning:', e.message);
   }
+
   return globalUsers.get(id) || null;
 }
 
@@ -119,6 +137,7 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
   };
 
   globalUsers.set(id, user);
+  globalAccountStore.set(cleanEmail, user);
 
   try {
     await fetch(`${getSupabaseUrl()}/rest/v1/users`, {
@@ -137,10 +156,11 @@ async function markEmailConfirmed(email) {
   const clean = email.trim().toLowerCase();
   globalConfirmedEmails.add(clean);
 
-  const user = await findUserByEmail(clean);
+  let user = await findUserByEmail(clean);
   if (user) {
     user.email_confirmed = true;
     globalUsers.set(user.id, user);
+    globalAccountStore.set(clean, user);
 
     try {
       await fetch(`${getSupabaseUrl()}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
@@ -156,10 +176,11 @@ async function markEmailConfirmed(email) {
 
 async function resetUserPassword(email, newPasswordHash) {
   const clean = email.trim().toLowerCase();
-  const user = await findUserByEmail(clean);
+  let user = await findUserByEmail(clean);
   if (user) {
     user.password_hash = newPasswordHash;
     globalUsers.set(user.id, user);
+    globalAccountStore.set(clean, user);
 
     try {
       await fetch(`${getSupabaseUrl()}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
@@ -254,7 +275,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     app: 'PulseRoom Vercel Engine',
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
-    usersCount: globalUsers.size,
+    usersCount: globalAccountStore.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -402,7 +423,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint (With Persistent Account Sync & Confirmation Enforcement)
+// 4. Login Endpoint (With Permanent Account Restoration & Password Match Check)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -490,6 +511,8 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
     if (bio !== undefined) user.bio = bio.trim();
 
     globalUsers.set(user.id, user);
+    if (user.email) globalAccountStore.set(user.email.toLowerCase(), user);
+
     const { password_hash, ...safe } = user;
     return res.json(safe);
   } catch (err) {
@@ -499,7 +522,7 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
 
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
-    const users = Array.from(globalUsers.values())
+    const users = Array.from(globalAccountStore.values())
       .filter(u => u.id !== req.user.id)
       .map(({ password_hash, ...safe }) => safe);
     return res.json(users);
@@ -516,7 +539,7 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. Rooms & Groups Endpoints (Guaranteed Safe Room Opening)
+// 7. Rooms & Groups Endpoints
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = Array.from(globalRooms.values()).filter(r =>
