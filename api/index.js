@@ -4,18 +4,48 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'pulseroom_super_secret_jwt_key_2026';
+const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impwb25wZG1vanV4eGFlY3hncGd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NjM2NzAsImV4cCI6MjEwMTAzOTY3MH0.hZI2QRFxU7ZHQ4FnH2pLnqQBA6BSUX3bih3WQRh6za4';
 
-// --------------------------------------------------------------------------
-// IN-MEMORY & DUAL DATABASE EMULATION FOR VERCEL SERVERLESS
-// --------------------------------------------------------------------------
+// In-Memory Fallback Map
 const memoryUsers = new Map();
 const memoryRooms = new Map();
 const memoryMessages = new Map();
 const memoryStatuses = new Map();
 
-// Helper functions for Vercel DB
+// Helper headers for Supabase REST API
+function getSupabaseHeaders() {
+  return {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation'
+  };
+}
+
+// --------------------------------------------------------------------------
+// PERSISTENT DB OPERATIONS (Supabase Cloud DB + Memory Fallback)
+// --------------------------------------------------------------------------
 async function findUserByEmail(email) {
   const clean = email.trim().toLowerCase();
+  
+  // 1. Try Supabase Cloud Database first
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
+      headers: getSupabaseHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        memoryUsers.set(data[0].id, data[0]);
+        return data[0];
+      }
+    }
+  } catch (e) {
+    console.warn('Supabase fetch user error:', e.message);
+  }
+
+  // 2. Fallback to Memory Map
   for (const user of memoryUsers.values()) {
     if (user.email.toLowerCase() === clean) return user;
   }
@@ -23,6 +53,23 @@ async function findUserByEmail(email) {
 }
 
 async function findUserById(id) {
+  if (memoryUsers.has(id)) return memoryUsers.get(id);
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(id)}&select=*`, {
+      headers: getSupabaseHeaders()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        memoryUsers.set(data[0].id, data[0]);
+        return data[0];
+      }
+    }
+  } catch (e) {
+    console.warn('Supabase findById error:', e.message);
+  }
+
   return memoryUsers.get(id) || null;
 }
 
@@ -39,24 +86,60 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
     status: 'online',
     created_at: new Date().toISOString()
   };
+
+  // Save to Memory
   memoryUsers.set(id, user);
+
+  // Save to Supabase Cloud DB
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/users`, {
+      method: 'POST',
+      headers: getSupabaseHeaders(),
+      body: JSON.stringify(user)
+    });
+  } catch (e) {
+    console.warn('Supabase create user error:', e.message);
+  }
+
   return user;
 }
 
 async function confirmUserEmail(email) {
-  const user = await findUserByEmail(email);
+  const clean = email.trim().toLowerCase();
+  const user = await findUserByEmail(clean);
   if (user) {
     user.email_confirmed = true;
     memoryUsers.set(user.id, user);
+
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
+        method: 'PATCH',
+        headers: getSupabaseHeaders(),
+        body: JSON.stringify({ email_confirmed: true })
+      });
+    } catch (e) {
+      console.warn('Supabase confirm email error:', e.message);
+    }
   }
   return user;
 }
 
 async function resetUserPassword(email, newPasswordHash) {
-  const user = await findUserByEmail(email);
+  const clean = email.trim().toLowerCase();
+  const user = await findUserByEmail(clean);
   if (user) {
     user.password_hash = newPasswordHash;
     memoryUsers.set(user.id, user);
+
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
+        method: 'PATCH',
+        headers: getSupabaseHeaders(),
+        body: JSON.stringify({ password_hash: newPasswordHash })
+      });
+    } catch (e) {
+      console.warn('Supabase reset password error:', e.message);
+    }
   }
   return user;
 }
@@ -129,6 +212,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     app: 'PulseRoom Vercel Serverless Engine',
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
+    supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY),
     timestamp: new Date().toISOString()
   });
 });
@@ -452,7 +536,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   }
 });
 
-// Fallback JSON Error Handler (Prevents non-JSON responses on Vercel)
+// Fallback JSON Error Handler
 app.use((err, req, res, next) => {
   console.error('Unhandled Vercel Express Error:', err);
   res.status(500).json({ error: err.message || 'An unexpected server error occurred on Vercel.' });
