@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import nodemailer from 'nodemailer';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'pulseroom_super_secret_jwt_key_2026';
 const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
@@ -13,7 +14,6 @@ const memoryRooms = new Map();
 const memoryMessages = new Map();
 const memoryStatuses = new Map();
 
-// Helper headers for Supabase REST API
 function getSupabaseHeaders() {
   return {
     'apikey': SUPABASE_ANON_KEY,
@@ -23,12 +23,9 @@ function getSupabaseHeaders() {
   };
 }
 
-// --------------------------------------------------------------------------
-// PERSISTENT DB OPERATIONS (Supabase Cloud DB + Memory Fallback)
-// --------------------------------------------------------------------------
+// DB Helpers
 async function findUserByEmail(email) {
   const clean = email.trim().toLowerCase();
-  
   try {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -52,7 +49,6 @@ async function findUserByEmail(email) {
 
 async function findUserById(id) {
   if (memoryUsers.has(id)) return memoryUsers.get(id);
-
   try {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(id)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -67,7 +63,6 @@ async function findUserById(id) {
   } catch (e) {
     console.warn('Supabase findById error:', e.message);
   }
-
   return memoryUsers.get(id) || null;
 }
 
@@ -86,7 +81,6 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
   };
 
   memoryUsers.set(id, user);
-
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/users`, {
       method: 'POST',
@@ -96,7 +90,6 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
   } catch (e) {
     console.warn('Supabase create user error:', e.message);
   }
-
   return user;
 }
 
@@ -106,7 +99,6 @@ async function confirmUserEmail(email) {
   if (user) {
     user.email_confirmed = true;
     memoryUsers.set(user.id, user);
-
     try {
       await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
         method: 'PATCH',
@@ -126,7 +118,6 @@ async function resetUserPassword(email, newPasswordHash) {
   if (user) {
     user.password_hash = newPasswordHash;
     memoryUsers.set(user.id, user);
-
     try {
       await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
         method: 'PATCH',
@@ -140,56 +131,71 @@ async function resetUserPassword(email, newPasswordHash) {
   return user;
 }
 
-// Resend API Email Dispatcher
+// Dual-Engine Universal Email Dispatcher (Resend + Gmail Direct SMTP Backup)
 async function sendEmail({ to, subject, htmlText, plainText }) {
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  if (!resendKey) {
-    console.warn('RESEND_API_KEY missing in Vercel environment.');
-    return { success: false, reason: 'RESEND_API_KEY missing' };
+  const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
+  const gmailPass = (process.env.GMAIL_APP_PASS || 'bnxxglavytopcmxn').replace(/\s+/g, '').trim();
+
+  // 1. Try Resend API
+  if (resendKey) {
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${resendKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: 'PulseRoom Messenger <onboarding@resend.dev>',
+          to: [to],
+          subject,
+          html: htmlText,
+          text: plainText
+        })
+      });
+      const resData = await response.json();
+      if (response.ok && resData.id) {
+        return { success: true, provider: 'resend', id: resData.id };
+      } else {
+        console.warn('Resend API notice:', resData);
+      }
+    } catch (err) {
+      console.warn('Resend exception:', err.message);
+    }
   }
 
-  try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${resendKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: 'PulseRoom Messenger <onboarding@resend.dev>',
-        to: [to],
+  // 2. Direct Gmail SMTP Engine (Delivers to ANY email worldwide)
+  if (gmailUser && gmailPass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: gmailUser, pass: gmailPass }
+      });
+
+      const info = await transporter.sendMail({
+        from: `"PulseRoom Messenger" <${gmailUser}>`,
+        to,
         subject,
-        html: htmlText,
-        text: plainText
-      })
-    });
-    const resData = await response.json();
-    console.log('Resend Response:', resData);
-    if (response.ok && resData.id) {
-      return { success: true, messageId: resData.id };
-    } else {
-      return { success: false, error: resData };
+        text: plainText,
+        html: htmlText
+      });
+
+      return { success: true, provider: 'gmail_smtp', messageId: info.messageId };
+    } catch (gErr) {
+      console.error('Gmail Direct SMTP Exception:', gErr.message);
+      return { success: false, error: gErr.message };
     }
-  } catch (err) {
-    console.error('Resend fetch error:', err.message);
-    return { success: false, error: err.message };
   }
+
+  return { success: false, reason: 'No active mail dispatchers succeeded.' };
 }
 
-// --------------------------------------------------------------------------
-// EXPRESS APP CONFIGURATION FOR VERCEL
-// --------------------------------------------------------------------------
+// Express App
 const app = express();
-
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
 
-// Auth Middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -202,18 +208,15 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// Health Check Endpoint
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    app: 'PulseRoom Vercel Serverless Engine',
+    app: 'PulseRoom Vercel Engine',
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
-    supabaseConfigured: Boolean(SUPABASE_URL && SUPABASE_ANON_KEY),
     timestamp: new Date().toISOString()
   });
 });
 
-// 1. Sign Up (Register)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body || {};
@@ -267,7 +270,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 2. Email Confirmation Endpoint
 app.get('/api/auth/confirm-email', async (req, res) => {
   try {
     const { email } = req.query || {};
@@ -293,7 +295,6 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 3. Login Endpoint
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -328,12 +329,10 @@ app.post('/api/auth/login', async (req, res) => {
 
     return res.json({ token, user: safeUser });
   } catch (err) {
-    console.error('Vercel Login Error:', err);
     return res.status(500).json({ error: 'Server error during login.' });
   }
 });
 
-// 4. Password Reset
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const { email, newPassword } = req.body || {};
@@ -347,7 +346,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       const salt = await bcrypt.genSalt(10);
       const newHash = await bcrypt.hash(newPassword, salt);
       await resetUserPassword(cleanEmail, newHash);
-      return res.json({ message: 'Password updated successfully! You can now log in with your new password.' });
+      return res.json({ message: 'Password updated successfully! You can now log in.' });
     }
     return res.json({ message: 'Account found.' });
   } catch (err) {
@@ -355,7 +354,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
-// 5. User Profile Endpoints
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const user = await findUserById(req.user.id);
@@ -396,7 +394,6 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
-// 6. Rooms Endpoints
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = Array.from(memoryRooms.values()).filter(r =>
@@ -422,10 +419,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
         id: roomId,
         type: 'private',
         partner: partner ? { id: partner.id, username: partner.username, avatar_url: partner.avatar_url, bio: partner.bio } : null,
-        members: [
-          { id: me.id, username: me.username },
-          { id: partner.id, username: partner.username }
-        ],
+        members: [{ id: me.id }, { id: partner.id }],
         created_at: new Date().toISOString()
       };
       memoryRooms.set(roomId, room);
@@ -445,7 +439,6 @@ app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. Statuses Endpoints
 app.get('/api/statuses', authenticateToken, async (req, res) => {
   try {
     const statuses = Array.from(memoryStatuses.values());
@@ -480,7 +473,6 @@ app.post('/api/statuses', authenticateToken, async (req, res) => {
   }
 });
 
-// 8. Friends Invite Endpoint
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -525,7 +517,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
 
       return res.json({
         status: 'invited',
-        message: `Invitation email dispatched to ${cleanEmail} via Resend!`
+        message: `Invitation email dispatched to ${cleanEmail}!`
       });
     }
   } catch (err) {
@@ -533,7 +525,6 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   }
 });
 
-// Fallback JSON Error Handler
 app.use((err, req, res, next) => {
   console.error('Unhandled Vercel Express Error:', err);
   res.status(500).json({ error: err.message || 'An unexpected server error occurred on Vercel.' });
