@@ -55,7 +55,7 @@ function verifyConfirmationToken(token) {
   }
 }
 
-// Universal Resilient User Finder (Memory + Global Store + Supabase REST DB)
+// Resilient User Account Finder
 async function findUserByEmail(email) {
   if (!email) return null;
   const clean = email.trim().toLowerCase();
@@ -193,14 +193,14 @@ async function resetUserPassword(email, newPasswordHash) {
   return user;
 }
 
-// Universal Multi-Provider Email Dispatcher
+// Universal Multi-Provider Email Dispatcher (Gmail SMTP Priority #1)
 async function sendEmail({ to, subject, htmlText, plainText }) {
   const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
   const rawPass = (process.env.GMAIL_APP_PASS || 'ptxubglafsafnrxr').trim();
   const gmailPass = rawPass.replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-  // Priority 1: Direct Gmail SMTP Engine (Delivers to ANY Email Address)
+  // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Address)
   if (gmailUser && gmailPass) {
     try {
       const transporter = nodemailer.createTransport({
@@ -216,7 +216,9 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
         html: htmlText
       });
 
-      return { success: true, provider: 'gmail', messageId: info.messageId };
+      if (info.messageId) {
+        return { success: true, provider: 'gmail', messageId: info.messageId };
+      }
     } catch (gErr) {
       console.error('Gmail Direct SMTP Error:', gErr.message);
     }
@@ -248,7 +250,7 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     }
   }
 
-  return { success: false, error: 'Email dispatch failed. Please verify mail configuration.' };
+  return { success: false, error: 'Email dispatch failed. Please verify mail credentials.' };
 }
 
 // Express App
@@ -278,7 +280,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 1. Sign Up Endpoint
+// 1. Sign Up Endpoint (Creates User with email_confirmed = false)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body || {};
@@ -331,7 +333,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     return res.status(201).json({
-      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox to confirm before logging in!`,
+      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox (including Spam folder) to confirm before logging in!`,
       email: cleanEmail,
       sendResult: sendRes
     });
@@ -384,7 +386,7 @@ app.post('/api/auth/resend-confirmation', async (req, res) => {
   }
 });
 
-// 3. Email Confirmation Callback Endpoint
+// 3. Email Confirmation Callback Endpoint (Activates Account)
 app.get('/api/auth/confirm-email', async (req, res) => {
   try {
     const { token, email } = req.query || {};
@@ -421,7 +423,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint (Preserves Registered Username)
+// 4. Login Endpoint (STRICT EMAIL CONFIRMATION ENFORCED)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -433,29 +435,24 @@ app.post('/api/auth/login', async (req, res) => {
     let user = await findUserByEmail(cleanEmail);
 
     if (!user) {
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(password, salt);
-      const defaultUsername = (req.body.username && req.body.username.trim()) ? req.body.username.trim() : cleanEmail.split('@')[0];
-
-      user = await createUser({
-        username: defaultUsername,
-        email: cleanEmail,
-        passwordHash,
-        emailConfirmed: true
-      });
+      return res.status(401).json({ error: 'No account found with this email. Click "Sign Up" to create an account!' });
     }
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
-      const salt = await bcrypt.genSalt(10);
-      user.password_hash = await bcrypt.hash(password, salt);
+      return res.status(401).json({ error: 'Incorrect password. Please try again or click "Forgot Password?".' });
     }
 
+    // Check if email is confirmed
     if (globalConfirmedEmails.has(cleanEmail)) {
       user.email_confirmed = true;
     }
 
-    user.email_confirmed = true;
+    if (!user.email_confirmed) {
+      return res.status(403).json({
+        error: 'Please confirm your email address first before logging in. Check your email inbox (including Spam folder) for the confirmation link!'
+      });
+    }
 
     const { password_hash, ...safeUser } = user;
     const token = jwt.sign(
@@ -756,7 +753,7 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
-// 10. Friends Invite Endpoint (Instant Chat Room Opening)
+// 10. Friends Invite Endpoint
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body || {};
