@@ -153,25 +153,26 @@ export default function StatusTray({ onOpenCreateStatus }) {
     markStatusSeen(activeStatus.id);
 
     setProgress(0);
-    const duration = activeStatus.media_type === 'video' ? 10000 : 5000; // 5s for photo/text, 10s for video
+    const startTime = Date.now();
+    const duration = activeStatus.media_type === 'video' ? 10000 : 5000;
     const stepTime = 50;
     const increment = (stepTime / duration) * 100;
 
     progressIntervalRef.current = setInterval(() => {
-      setProgress(prev => {
-        if (prev >= 100) {
-          clearInterval(progressIntervalRef.current);
-          handleNextStory();
-          return 100;
-        }
-        return prev + increment;
-      });
+      const elapsed = Date.now() - startTime;
+      const pct = Math.min(100, (elapsed / duration) * 100);
+      setProgress(pct);
+
+      if (elapsed >= duration) {
+        clearInterval(progressIntervalRef.current);
+        handleNextStory();
+      }
     }, stepTime);
 
     return () => {
       if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
     };
-  }, [currentIndex, viewingQueue]);
+  }, [currentIndex, activeStatus?.id]);
 
   const handleNextStory = () => {
     if (currentIndex < viewingQueue.length - 1) {

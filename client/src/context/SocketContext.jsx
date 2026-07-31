@@ -5,10 +5,10 @@ import { useAuth } from './AuthContext';
 const SocketContext = createContext();
 
 export function SocketProvider({ children }) {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
   const [socket, setSocket] = useState(null);
   const [onlineUsers, setOnlineUsers] = useState(new Set());
-  const [typingState, setTypingState] = useState({}); // { roomId: username }
+  const [typingState, setTypingState] = useState({});
 
   useEffect(() => {
     if (!user) {
@@ -16,14 +16,14 @@ export function SocketProvider({ children }) {
       return;
     }
 
-    // Connect to backend port 5000 directly or via proxy
     const socketUrl = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
       ? 'http://localhost:5000' 
       : undefined;
 
     const newSocket = io(socketUrl, {
+      auth: { token },
       transports: ['websocket', 'polling'],
-      reconnectionAttempts: 10,
+      reconnectionAttempts: 5,
     });
 
     newSocket.on('connect', () => {
@@ -50,16 +50,16 @@ export function SocketProvider({ children }) {
     setSocket(newSocket);
 
     return () => newSocket.disconnect();
-  }, [user]);
+  }, [user, token]);
 
   const joinRoom = (roomId) => {
-    if (socket && roomId) {
+    if (socket && roomId && socket.connected) {
       socket.emit('join_room', roomId);
     }
   };
 
-  const sendMessage = ({ roomId, text, type, mediaUrl, replyToId }) => {
-    if (socket && user) {
+  const sendMessage = async ({ roomId, text, type, mediaUrl, replyToId }) => {
+    if (socket && socket.connected && user) {
       socket.emit('send_message', {
         roomId,
         senderId: user.id,
@@ -68,11 +68,25 @@ export function SocketProvider({ children }) {
         mediaUrl,
         replyToId
       });
+    } else if (token) {
+      // REST HTTP Message Fallback when Socket.IO server is disconnected (e.g. Vercel Serverless environment)
+      try {
+        await fetch('/api/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ roomId, text, type: type || 'text', mediaUrl, replyToId })
+        });
+      } catch (err) {
+        console.error('HTTP REST sendMessage fallback error:', err);
+      }
     }
   };
 
   const setTyping = (roomId, isTyping) => {
-    if (socket && user) {
+    if (socket && socket.connected && user) {
       if (isTyping) {
         socket.emit('typing_start', { roomId, username: user.username });
       } else {
@@ -82,7 +96,7 @@ export function SocketProvider({ children }) {
   };
 
   const toggleReaction = (messageId, roomId, emoji) => {
-    if (socket && user) {
+    if (socket && socket.connected && user) {
       socket.emit('toggle_reaction', { messageId, roomId, emoji, userId: user.id });
     }
   };

@@ -480,13 +480,32 @@ export const db = {
 
   togglePinChat: async (userId, roomId) => {
     const key = `${userId}:${roomId}`;
+    let isPinned = false;
     if (memoryDb.pinned_chats.has(key)) {
       memoryDb.pinned_chats.delete(key);
-      return false;
+      isPinned = false;
     } else {
       memoryDb.pinned_chats.add(key);
-      return true;
+      isPinned = true;
     }
+
+    if (isPgConnected) {
+      try {
+        const res = await pool.query(`SELECT theme_preferences FROM users WHERE id = $1`, [userId]);
+        let prefs = res.rows[0]?.theme_preferences || {};
+        let pins = Array.isArray(prefs.pinned_rooms) ? prefs.pinned_rooms : [];
+        if (isPinned) {
+          if (!pins.includes(roomId)) pins.push(roomId);
+        } else {
+          pins = pins.filter(id => id !== roomId);
+        }
+        prefs.pinned_rooms = pins;
+        await pool.query(`UPDATE users SET theme_preferences = $1 WHERE id = $2`, [JSON.stringify(prefs), userId]);
+      } catch (e) {
+        console.warn('Persist pinned chat error:', e.message);
+      }
+    }
+    return isPinned;
   },
 
   // Room Bridges

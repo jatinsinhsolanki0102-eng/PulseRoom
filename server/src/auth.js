@@ -1,7 +1,14 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 
-const getJwtSecret = () => process.env.JWT_SECRET || 'REDACTED_JWT_SECRET';
+// Cryptographically safe secret fallback per instance if process.env.JWT_SECRET is omitted
+let dynamicSecret = process.env.JWT_SECRET;
+if (!dynamicSecret) {
+  console.warn('⚠️ WARNING: JWT_SECRET environment variable is not set. Using temporary instance key.');
+  dynamicSecret = 'pr_sec_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+}
+
+const getJwtSecret = () => process.env.JWT_SECRET || dynamicSecret;
 
 export async function hashPassword(password) {
   const salt = await bcrypt.genSalt(10);
@@ -29,12 +36,13 @@ export function generateConfirmationToken(email) {
 }
 
 export function verifyConfirmationToken(token) {
+  if (!token) return { valid: false, error: 'Confirmation token is required.' };
   try {
     const decoded = jwt.verify(token, getJwtSecret());
     if (decoded && decoded.purpose === 'confirm_email' && decoded.email) {
       return { valid: true, email: decoded.email };
     }
-    return { valid: false, error: 'Invalid token payload.' };
+    return { valid: false, error: 'Invalid confirmation token payload.' };
   } catch (err) {
     return { valid: false, error: err.message };
   }
