@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { MessageSquare, Sparkles, User, Mail, Lock, ArrowLeft, MailCheck, CheckCircle, Zap } from 'lucide-react';
+import { MessageSquare, Sparkles, User, Mail, Lock, ArrowLeft, MailCheck, CheckCircle, RefreshCw } from 'lucide-react';
 
 export default function AuthModal() {
   const { login } = useAuth();
@@ -18,7 +18,6 @@ export default function AuthModal() {
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [loading, setLoading] = useState(false);
-  const [confirming, setConfirming] = useState(false);
 
   const avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${avatarSeed}`;
 
@@ -36,10 +35,11 @@ export default function AuthModal() {
     }
   };
 
-  // 2. Register Account & Send Resend Email Confirmation Link
+  // 2. Register Account & Send Email Confirmation Link
   const handleRegisterSubmit = async (e) => {
     e.preventDefault();
     setError('');
+    setSuccessMsg('');
     setLoading(true);
 
     try {
@@ -58,7 +58,7 @@ export default function AuthModal() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to create account.');
 
-      setSuccessMsg(`A confirmation link has been sent to ${email}`);
+      setSuccessMsg(data.message || `A confirmation link has been sent to ${email}`);
       setMode('email-sent');
     } catch (err) {
       setError(err.message);
@@ -67,19 +67,24 @@ export default function AuthModal() {
     }
   };
 
-  // 3. Confirm Email Shortcut from Screen
-  const handleInstantConfirm = async () => {
-    setConfirming(true);
+  // 3. Resend Email Confirmation Link
+  const handleResendConfirmation = async () => {
+    setLoading(true);
     setError('');
+    setSuccessMsg('');
     try {
-      const res = await fetch(`/api/auth/confirm-email?email=${encodeURIComponent(email.trim())}`);
-      if (!res.ok) throw new Error('Failed to confirm email.');
-
-      // Email confirmed! Log in directly
-      await login(email.trim(), password);
+      const res = await fetch('/api/auth/resend-confirmation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to resend confirmation email.');
+      setSuccessMsg(data.message || `Confirmation email re-dispatched to ${email}`);
     } catch (err) {
       setError(err.message);
-      setConfirming(false);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -143,6 +148,21 @@ export default function AuthModal() {
             textAlign: 'center'
           }}>
             {error}
+          </div>
+        )}
+
+        {successMsg && mode === 'email-sent' && (
+          <div style={{
+            background: 'rgba(16, 185, 129, 0.15)',
+            border: '1px solid rgba(16, 185, 129, 0.3)',
+            color: '#34d399',
+            padding: '0.75rem 1rem',
+            borderRadius: '12px',
+            fontSize: '0.85rem',
+            marginBottom: '1rem',
+            textAlign: 'center'
+          }}>
+            {successMsg}
           </div>
         )}
 
@@ -277,7 +297,7 @@ export default function AuthModal() {
           </form>
         )}
 
-        {/* 3. EMAIL SENT SCREEN (Resend Email Link + Screen Shortcut) */}
+        {/* 3. EMAIL SENT SCREEN */}
         {mode === 'email-sent' && (
           <div style={{ textAlign: 'center', padding: '0.5rem 0' }}>
             <div style={{
@@ -298,17 +318,30 @@ export default function AuthModal() {
               Confirmation Email Dispatched!
             </h3>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', lineHeight: '1.5', maxWidth: '360px', margin: '0 auto 1.25rem' }}>
-              We dispatched an email via Resend to <strong style={{ color: 'white' }}>{email}</strong>. Open your email inbox and click <strong>Confirm Email Address</strong> to activate your account!
+              We sent an email to <strong style={{ color: 'white' }}>{email}</strong>. Open your email inbox and click <strong>Confirm Email Address</strong> to activate your account!
             </p>
 
-            <button
-              type="button"
-              onClick={() => { setMode('login'); setError(''); }}
-              className="send-btn-gradient-circle"
-              style={{ width: '100%', borderRadius: '12px', height: '48px', fontWeight: '700', fontSize: '1rem', marginTop: '0.5rem' }}
-            >
-              Go to Sign In
-            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.5rem' }}>
+              <button
+                type="button"
+                onClick={handleResendConfirmation}
+                disabled={loading}
+                className="chip-btn"
+                style={{ padding: '0.75rem 1rem', borderRadius: '10px', fontSize: '0.85rem', fontWeight: '700', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+              >
+                <RefreshCw size={16} className={loading ? 'spin-icon' : ''} />
+                {loading ? 'Resending Link...' : 'Didn\'t get email? Resend Confirmation Link'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => { setMode('login'); setError(''); setSuccessMsg(''); }}
+                className="send-btn-gradient-circle"
+                style={{ width: '100%', borderRadius: '12px', height: '48px', fontWeight: '700', fontSize: '1rem' }}
+              >
+                Go to Sign In
+              </button>
+            </div>
           </div>
         )}
 
@@ -378,7 +411,7 @@ export default function AuthModal() {
 
             <button
               type="button"
-              onClick={() => { setMode('login'); setError(''); }}
+              onClick={() => { setMode('login'); setError(''); setSuccessMsg(''); }}
               className="send-btn-gradient-circle"
               style={{ width: '100%', borderRadius: '12px', height: '48px', fontWeight: '700', fontSize: '1rem' }}
             >
