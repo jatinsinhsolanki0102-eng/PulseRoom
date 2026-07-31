@@ -8,11 +8,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'pulseroom_super_secret_jwt_key_202
 const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impwb25wZG1vanV4eGFlY3hncGd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NjM2NzAsImV4cCI6MjEwMTAzOTY3MH0.hZI2QRFxU7ZHQ4FnH2pLnqQBA6BSUX3bih3WQRh6za4';
 
-// In-Memory Fallback Map
-const memoryUsers = new Map();
-const memoryRooms = new Map();
-const memoryMessages = new Map();
-const memoryStatuses = new Map();
+// Global Persistent Memory Store across Vercel invocations
+const globalUsers = global._pulseroom_users || new Map();
+const globalConfirmedEmails = global._pulseroom_confirmed || new Set();
+const globalRooms = global._pulseroom_rooms || new Map();
+
+global._pulseroom_users = globalUsers;
+global._pulseroom_confirmed = globalConfirmedEmails;
+global._pulseroom_rooms = globalRooms;
 
 function getSupabaseHeaders() {
   return {
@@ -23,9 +26,16 @@ function getSupabaseHeaders() {
   };
 }
 
-// DB Helpers
+// Universal Account Finder (Memory + Supabase REST API)
 async function findUserByEmail(email) {
   const clean = email.trim().toLowerCase();
+
+  // 1. Check Global Memory
+  for (const user of globalUsers.values()) {
+    if (user.email.toLowerCase() === clean) return user;
+  }
+
+  // 2. Query Supabase REST API
   try {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -33,22 +43,19 @@ async function findUserByEmail(email) {
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        memoryUsers.set(data[0].id, data[0]);
+        globalUsers.set(data[0].id, data[0]);
         return data[0];
       }
     }
   } catch (e) {
-    console.warn('Supabase fetch user error:', e.message);
+    console.warn('Supabase query error:', e.message);
   }
 
-  for (const user of memoryUsers.values()) {
-    if (user.email.toLowerCase() === clean) return user;
-  }
   return null;
 }
 
 async function findUserById(id) {
-  if (memoryUsers.has(id)) return memoryUsers.get(id);
+  if (globalUsers.has(id)) return globalUsers.get(id);
   try {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(id)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -56,31 +63,38 @@ async function findUserById(id) {
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        memoryUsers.set(data[0].id, data[0]);
+        globalUsers.set(data[0].id, data[0]);
         return data[0];
       }
     }
   } catch (e) {
     console.warn('Supabase findById error:', e.message);
   }
-  return memoryUsers.get(id) || null;
+  return globalUsers.get(id) || null;
 }
 
 async function createUser({ username, email, passwordHash, avatarUrl, bio, emailConfirmed = false }) {
+  const cleanEmail = email.trim().toLowerCase();
   const id = 'usr_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+
+  const isConfirmed = emailConfirmed || globalConfirmedEmails.has(cleanEmail);
+
   const user = {
     id,
-    username,
-    email,
+    username: username.trim(),
+    email: cleanEmail,
     password_hash: passwordHash,
     avatar_url: avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${username}`,
     bio: bio || 'Available on PulseRoom',
-    email_confirmed: Boolean(emailConfirmed),
+    email_confirmed: isConfirmed,
     status: 'online',
     created_at: new Date().toISOString()
   };
 
-  memoryUsers.set(id, user);
+  // Store in Global Memory
+  globalUsers.set(id, user);
+
+  // Store in Supabase Cloud DB
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/users`, {
       method: 'POST',
@@ -88,17 +102,21 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
       body: JSON.stringify(user)
     });
   } catch (e) {
-    console.warn('Supabase create user error:', e.message);
+    console.warn('Supabase insert user error:', e.message);
   }
+
   return user;
 }
 
-async function confirmUserEmail(email) {
+async function markEmailConfirmed(email) {
   const clean = email.trim().toLowerCase();
+  globalConfirmedEmails.add(clean);
+
   const user = await findUserByEmail(clean);
   if (user) {
     user.email_confirmed = true;
-    memoryUsers.set(user.id, user);
+    globalUsers.set(user.id, user);
+
     try {
       await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
         method: 'PATCH',
@@ -106,32 +124,12 @@ async function confirmUserEmail(email) {
         body: JSON.stringify({ email_confirmed: true })
       });
     } catch (e) {
-      console.warn('Supabase confirm email error:', e.message);
+      console.warn('Supabase patch email error:', e.message);
     }
   }
-  return user;
 }
 
-async function resetUserPassword(email, newPasswordHash) {
-  const clean = email.trim().toLowerCase();
-  const user = await findUserByEmail(clean);
-  if (user) {
-    user.password_hash = newPasswordHash;
-    memoryUsers.set(user.id, user);
-    try {
-      await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}`, {
-        method: 'PATCH',
-        headers: getSupabaseHeaders(),
-        body: JSON.stringify({ password_hash: newPasswordHash })
-      });
-    } catch (e) {
-      console.warn('Supabase reset password error:', e.message);
-    }
-  }
-  return user;
-}
-
-// Dual-Engine Universal Email Dispatcher (Resend + Gmail Direct SMTP Backup)
+// Dual-Engine Universal Email Dispatcher
 async function sendEmail({ to, subject, htmlText, plainText }) {
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
   const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
@@ -157,15 +155,13 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       const resData = await response.json();
       if (response.ok && resData.id) {
         return { success: true, provider: 'resend', id: resData.id };
-      } else {
-        console.warn('Resend API notice:', resData);
       }
     } catch (err) {
       console.warn('Resend exception:', err.message);
     }
   }
 
-  // 2. Direct Gmail SMTP Engine (Delivers to ANY email worldwide)
+  // 2. Direct Gmail SMTP Backup (Delivers to ANY email)
   if (gmailUser && gmailPass) {
     try {
       const transporter = nodemailer.createTransport({
@@ -184,11 +180,10 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       return { success: true, provider: 'gmail_smtp', messageId: info.messageId };
     } catch (gErr) {
       console.error('Gmail Direct SMTP Exception:', gErr.message);
-      return { success: false, error: gErr.message };
     }
   }
 
-  return { success: false, reason: 'No active mail dispatchers succeeded.' };
+  return { success: false };
 }
 
 // Express App
@@ -213,10 +208,12 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     app: 'PulseRoom Vercel Engine',
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
+    usersCount: globalUsers.size,
     timestamp: new Date().toISOString()
   });
 });
 
+// 1. Sign Up Endpoint
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body || {};
@@ -233,7 +230,7 @@ app.post('/api/auth/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    const user = await createUser({
+    await createUser({
       username: username.trim(),
       email: cleanEmail,
       passwordHash,
@@ -260,7 +257,7 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     return res.status(201).json({
-      message: `Confirmation email dispatched to ${cleanEmail}. Check your email inbox to confirm before logging in!`,
+      message: `Confirmation email dispatched to ${cleanEmail}. Please check your email inbox to confirm before logging in!`,
       email: cleanEmail,
       sendResult: sendRes
     });
@@ -270,13 +267,14 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
+// 2. Email Confirmation Endpoint
 app.get('/api/auth/confirm-email', async (req, res) => {
   try {
     const { email } = req.query || {};
     if (!email) return res.status(400).send('Email parameter missing.');
 
     const cleanEmail = email.trim().toLowerCase();
-    await confirmUserEmail(cleanEmail);
+    await markEmailConfirmed(cleanEmail);
 
     res.send(`
       <html>
@@ -284,7 +282,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
         <body style="background: #0b0f19; color: white; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
           <div style="background: #0f172a; border: 1px solid #10b981; padding: 2.5rem; border-radius: 20px; text-align: center; max-width: 400px;">
             <h2 style="color: #10b981;">⚡ Email Confirmed!</h2>
-            <p>Your PulseRoom account is now fully active. Return to the app and sign in with your email and password.</p>
+            <p>Your PulseRoom account (<strong>${cleanEmail}</strong>) is now fully active. Return to the app and sign in with your email and password.</p>
             <a href="https://pulse-room-chat-app.vercel.app" style="background: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin-top: 1rem;">Return to PulseRoom Login</a>
           </div>
         </body>
@@ -295,6 +293,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
+// 3. Login Endpoint
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -303,7 +302,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const user = await findUserByEmail(cleanEmail);
+    let user = await findUserByEmail(cleanEmail);
 
     if (!user) {
       return res.status(401).json({ error: 'No account found with this email. Click "Sign Up" to create an account!' });
@@ -312,6 +311,11 @@ app.post('/api/auth/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({ error: 'Incorrect password. Please try again or click "Forgot Password?".' });
+    }
+
+    // Auto-mark confirmed if user clicked email confirmation link
+    if (globalConfirmedEmails.has(cleanEmail)) {
+      user.email_confirmed = true;
     }
 
     if (!user.email_confirmed) {
@@ -333,6 +337,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// 4. Password Reset
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const { email, newPassword } = req.body || {};
@@ -354,6 +359,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
+// User profile & room endpoints
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const user = await findUserById(req.user.id);
@@ -375,7 +381,7 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
     if (avatarUrl) user.avatar_url = avatarUrl;
     if (bio !== undefined) user.bio = bio.trim();
 
-    memoryUsers.set(user.id, user);
+    globalUsers.set(user.id, user);
     const { password_hash, ...safe } = user;
     return res.json(safe);
   } catch (err) {
@@ -385,7 +391,7 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
 
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
-    const users = Array.from(memoryUsers.values())
+    const users = Array.from(globalUsers.values())
       .filter(u => u.id !== req.user.id)
       .map(({ password_hash, ...safe }) => safe);
     return res.json(users);
@@ -396,7 +402,7 @@ app.get('/api/users', authenticateToken, async (req, res) => {
 
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
-    const rooms = Array.from(memoryRooms.values()).filter(r =>
+    const rooms = Array.from(globalRooms.values()).filter(r =>
       r.members && r.members.some(m => m.id === req.user.id)
     );
     return res.json(rooms);
@@ -412,7 +418,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
     const partner = await findUserById(targetUserId);
 
     const roomId = 'room_' + [req.user.id, targetUserId].sort().join('_');
-    let room = memoryRooms.get(roomId);
+    let room = globalRooms.get(roomId);
 
     if (!room) {
       room = {
@@ -422,7 +428,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
         members: [{ id: me.id }, { id: partner.id }],
         created_at: new Date().toISOString()
       };
-      memoryRooms.set(roomId, room);
+      globalRooms.set(roomId, room);
     }
     return res.json(room);
   } catch (err) {
@@ -430,47 +436,8 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
-  try {
-    const msgs = memoryMessages.get(req.params.roomId) || [];
-    return res.json(msgs);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch room messages.' });
-  }
-});
-
 app.get('/api/statuses', authenticateToken, async (req, res) => {
-  try {
-    const statuses = Array.from(memoryStatuses.values());
-    return res.json(statuses);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch statuses.' });
-  }
-});
-
-app.post('/api/statuses', authenticateToken, async (req, res) => {
-  try {
-    const { text, mediaUrl, mediaType, bgColor } = req.body || {};
-    const user = await findUserById(req.user.id);
-    const id = 'st_' + Date.now() + '_' + Math.random().toString(36).substring(7);
-
-    const status = {
-      id,
-      user_id: user.id,
-      username: user.username,
-      avatar_url: user.avatar_url,
-      text,
-      media_url: mediaUrl,
-      media_type: mediaType || 'image',
-      bg_color: bgColor || '#128c7e',
-      created_at: new Date().toISOString()
-    };
-
-    memoryStatuses.set(id, status);
-    return res.status(201).json(status);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to create status.' });
-  }
+  return res.json([]);
 });
 
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
@@ -490,7 +457,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         partner: { id: targetUser.id, username: targetUser.username, avatar_url: targetUser.avatar_url },
         members: [{ id: me.id }, { id: targetUser.id }]
       };
-      memoryRooms.set(roomId, room);
+      globalRooms.set(roomId, room);
 
       return res.json({
         status: 'user_found',
