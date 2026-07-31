@@ -43,7 +43,7 @@ export async function initDb() {
         status VARCHAR(20) DEFAULT 'online',
         last_seen TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         theme_preferences JSONB DEFAULT '{}',
-        email_confirmed BOOLEAN DEFAULT TRUE,
+        email_confirmed BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
@@ -621,11 +621,11 @@ export const db = {
 
   deleteMessage: async (messageId, userId) => {
     if (isPgConnected) {
-      const res = await pool.query(`DELETE FROM messages WHERE id = $1 RETURNING room_id`, [messageId]);
+      const res = await pool.query(`DELETE FROM messages WHERE id = $1 AND sender_id = $2 RETURNING room_id`, [messageId, userId]);
       return res.rows[0];
     } else {
       const msg = memoryDb.messages.get(messageId);
-      if (msg) {
+      if (msg && msg.sender_id === userId) {
         const roomId = msg.room_id;
         memoryDb.messages.delete(messageId);
         return { room_id: roomId };

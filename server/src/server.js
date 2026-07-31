@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
 
 import { initDb, db } from './db.js';
-import { hashPassword, comparePassword, generateToken, authenticateToken } from './auth.js';
+import { hashPassword, comparePassword, generateToken, generateConfirmationToken, verifyConfirmationToken, authenticateToken } from './auth.js';
 import { setupSocketHandlers, notifyRoomCreated } from './socketHandler.js';
 
 dotenv.config();
@@ -17,9 +17,6 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
-
-// Temporary Store
-const pendingPasswordResets = new Map();
 
 // Test mailer fallback
 let etherealTransporter = null;
@@ -39,22 +36,18 @@ async function initMailer() {
 }
 initMailer();
 
-// Multi-Provider Email Dispatcher (Resend Priority #1)
+// Multi-Provider Email Dispatcher
 async function sendEmail({ to, subject, htmlText, plainText }) {
-  dotenv.config({ override: true });
-
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
   const gmailUser = (process.env.GMAIL_USER || '').trim();
   const rawPass = (process.env.GMAIL_APP_PASS || '').trim();
   const gmailPass = rawPass.replace(/\s+/g, '');
-  const brevoApiKey = (process.env.BREVO_API_KEY || process.env.BREVO_SMTP_PASS || '').trim();
-  const senderEmail = (process.env.BREVO_SENDER_EMAIL || gmailUser || 'onboarding@resend.dev').trim();
 
   console.log(`\n📧 Dispatching Email to ${to}...`);
 
-  // Priority 1: Resend API (3,000 Free Emails/Month, Instant Delivery)
+  // Priority 1: Resend API (If Key Provided)
   if (resendKey) {
-    console.log(`🚀 Dispatching via Resend API (Key: ${resendKey.substring(0, 8)}...)...`);
+    console.log(`🚀 Dispatching via Resend API...`);
     try {
       const response = await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -72,10 +65,8 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       });
       const resData = await response.json();
       if (response.ok && resData.id) {
-        console.log(`\n==================================================`);
         console.log(`✅ RESEND EMAIL DELIVERED TO ${to}! MessageID: ${resData.id}`);
-        console.log(`==================================================\n`);
-        return { success: true, messageId: resData.id };
+        return { success: true, provider: 'resend', messageId: resData.id };
       } else {
         console.warn('⚠️ Resend API notice:', resData.message || resData);
       }
@@ -84,7 +75,7 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 2: Direct Gmail SMTP Engine
+  // Priority 2: Direct Gmail SMTP Engine (Universal Delivery)
   if (gmailUser && gmailPass) {
     console.log(`🔄 Dispatching via Gmail SMTP (${gmailUser})...`);
     try {
@@ -101,10 +92,8 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
         html: htmlText
       });
 
-      console.log(`\n==================================================`);
       console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to}! MessageID: ${info.messageId}`);
-      console.log(`==================================================\n`);
-      return { success: true, messageId: info.messageId };
+      return { success: true, provider: 'gmail', messageId: info.messageId };
     } catch (gErr) {
       console.error(`❌ GMAIL SMTP ERROR: ${gErr.message}`);
     }
@@ -114,21 +103,21 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   if (etherealTransporter) {
     try {
       const info = await etherealTransporter.sendMail({
-        from: `"PulseRoom Messenger" <${senderEmail}>`,
+        from: `"PulseRoom Messenger" <noreply@pulseroom.app>`,
         to,
         subject,
         text: plainText,
         html: htmlText
       });
       const testUrl = nodemailer.getTestMessageUrl(info);
-      console.log(`📧 Test Mail Preview URL: ${testUrl}`);
-      return { success: true, previewUrl: testUrl };
+      console.log(`📧 Ethereal Test Mail Preview URL: ${testUrl}`);
+      return { success: true, provider: 'ethereal', previewUrl: testUrl };
     } catch (e) {
       console.error('Nodemailer Fallback Error:', e.message);
     }
   }
 
-  return { success: false };
+  return { success: false, error: 'No active email dispatchers succeeded. Configure RESEND_API_KEY or GMAIL_USER/GMAIL_APP_PASS.' };
 }
 
 // Setup CORS
@@ -140,8 +129,8 @@ app.use(cors({
 
 app.use(express.json());
 
-// Uploads directory setup
-const uploadsDir = path.resolve('uploads');
+// Uploads directory setup (Relative to process.cwd())
+const uploadsDir = path.resolve(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -184,7 +173,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 1. Auth: Sign Up (Email Confirmation Link Required Before Login)
+// 1. Auth: Sign Up (Email Confirmation Required Before Login)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body;
@@ -194,7 +183,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // Check if user already exists
     const existingUser = await db.findUserByEmail(cleanEmail);
     if (existingUser) {
       return res.status(400).json({ error: 'Account with this email already exists. Please log in.' });
@@ -202,7 +190,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     const passwordHash = await hashPassword(password);
     
-    // Create user record with email_confirmed = false (Strict Confirmation Required)
     const user = await db.createUser({
       username: username.trim(),
       email: cleanEmail,
@@ -212,8 +199,10 @@ app.post('/api/auth/register', async (req, res) => {
       emailConfirmed: false
     });
 
-    // Direct Confirmation Link Email Dispatch via Resend API
-    const confirmLink = `http://localhost:5000/api/auth/confirm-email?email=${encodeURIComponent(cleanEmail)}`;
+    const baseUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    const confirmToken = generateConfirmationToken(cleanEmail);
+    const confirmLink = `${baseUrl}/api/auth/confirm-email?token=${confirmToken}&email=${encodeURIComponent(cleanEmail)}`;
+
     const htmlText = `
       <div style="font-family: 'Plus Jakarta Sans', Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.1);">
         <div style="text-align: center; margin-bottom: 20px;">
@@ -238,6 +227,12 @@ app.post('/api/auth/register', async (req, res) => {
       htmlText
     });
 
+    if (!result.success) {
+      return res.status(500).json({
+        error: result.error || 'Account created, but we could not send the confirmation email right now. Please verify mail credentials.'
+      });
+    }
+
     res.status(201).json({
       message: `Confirmation email dispatched to ${cleanEmail}. Please check your email inbox and click the link to confirm before logging in.`,
       email: cleanEmail,
@@ -249,22 +244,64 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Backward compatibility alias for /api/auth/send-otp -> register
-app.post('/api/auth/send-otp', async (req, res) => {
-  return app._router.handle({ ...req, url: '/api/auth/register' }, res);
+// 2. Auth: Resend Confirmation Email Route
+app.post('/api/auth/resend-confirmation', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email address is required.' });
+
+    const cleanEmail = email.trim().toLowerCase();
+    const user = await db.findUserByEmail(cleanEmail);
+    if (!user) return res.status(404).json({ error: 'No account found with this email.' });
+    if (user.email_confirmed) return res.status(400).json({ error: 'This email address is already confirmed. Please sign in.' });
+
+    const baseUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    const confirmToken = generateConfirmationToken(cleanEmail);
+    const confirmLink = `${baseUrl}/api/auth/confirm-email?token=${confirmToken}&email=${encodeURIComponent(cleanEmail)}`;
+
+    const htmlText = `
+      <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
+        <h1 style="color: #10b981;">PulseRoom</h1>
+        <p>Hello <strong>${user.username}</strong>,</p>
+        <p>Click below to confirm your email address and activate your account:</p>
+        <a href="${confirmLink}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Confirm Email Address</a>
+      </div>
+    `;
+
+    const result = await sendEmail({
+      to: cleanEmail,
+      subject: `Confirm your PulseRoom email address`,
+      plainText: `Hello ${user.username}, please confirm your email: ${confirmLink}`,
+      htmlText
+    });
+
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || 'Failed to send confirmation email. Check mail server setup.' });
+    }
+
+    res.json({ message: `Confirmation email re-dispatched to ${cleanEmail}. Check your inbox!` });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to resend confirmation email.' });
+  }
 });
 
-// 2. Auth: Email Confirmation Callback Route
+// 3. Auth: Email Confirmation Callback Route
 app.get('/api/auth/confirm-email', async (req, res) => {
   try {
-    const { email } = req.query;
+    const { token, email } = req.query;
     if (!email) return res.status(400).send('Email parameter missing.');
 
     const cleanEmail = email.trim().toLowerCase();
+
+    if (token) {
+      const verification = verifyConfirmationToken(token);
+      if (!verification.valid || verification.email !== cleanEmail) {
+        return res.status(400).send('Invalid or expired confirmation link.');
+      }
+    }
+
     await db.confirmUserEmail(cleanEmail);
-    console.log(`\n==================================================`);
-    console.log(`✅ EMAIL CONFIRMED FOR: ${cleanEmail}`);
-    console.log(`==================================================\n`);
+    const clientUrl = (process.env.CLIENT_URL || process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
 
     res.send(`
       <html>
@@ -280,8 +317,8 @@ app.get('/api/auth/confirm-email', async (req, res) => {
         <body>
           <div class="card">
             <h2>⚡ Email Confirmed!</h2>
-            <p>Your PulseRoom account is now fully active. You can return to the app and sign in with your email and password.</p>
-            <a href="http://localhost:3000">Return to PulseRoom Login</a>
+            <p>Your PulseRoom account is now fully active. Return to the app and sign in with your email and password.</p>
+            <a href="${clientUrl}">Return to PulseRoom Login</a>
           </div>
         </body>
       </html>
@@ -291,7 +328,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 3. Auth: Login with Email & Password (STRICT EMAIL CONFIRMATION ENFORCED)
+// 4. Auth: Login with Email & Password
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -311,10 +348,9 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Incorrect password. Please try again or click "Forgot Password?".' });
     }
 
-    // STRICT ENFORCEMENT: Check if email is confirmed
     if (!user.email_confirmed) {
       return res.status(403).json({
-        error: 'Please confirm your email address first before logging in. Open your email inbox and click "Confirm email address".'
+        error: 'Please confirm your email address first before logging in. Open your email inbox and click "Confirm Email Address".'
       });
     }
 
@@ -328,7 +364,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// 4. Auth: Password Reset
+// 5. Auth: Password Reset
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const { email, newPassword } = req.body;
@@ -356,7 +392,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
-// 5. User: Get Current Profile
+// 6. User: Get Current Profile
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const user = await db.findUserById(req.user.id);
@@ -367,7 +403,7 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
   }
 });
 
-// 6. User: Update Profile (Avatar Picture Upload, Username, Bio)
+// 7. User: Update Profile
 app.put('/api/users/profile', authenticateToken, async (req, res) => {
   try {
     const { username, avatarUrl, bio } = req.body;
@@ -380,7 +416,7 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. User: Search & List All Users
+// 8. User: Search & List All Users
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
     const users = await db.getAllUsers(req.user.id);
@@ -390,7 +426,7 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
-// 8. User: Update Theme Customization
+// 9. User: Update Theme Customization
 app.put('/api/users/theme', authenticateToken, async (req, res) => {
   try {
     const updatedTheme = await db.updateUserTheme(req.user.id, req.body);
@@ -400,7 +436,7 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
   }
 });
 
-// 9. Rooms: Get User Rooms
+// 10. Rooms: Get User Rooms
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = await db.getUserRooms(req.user.id);
@@ -410,7 +446,7 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
   }
 });
 
-// 10. Rooms: Initiate 1:1 Private Chat
+// 11. Rooms: Initiate 1:1 Private Chat
 app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   try {
     const { targetUserId } = req.body;
@@ -424,7 +460,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   }
 });
 
-// 11. Rooms: Create Group Room
+// 12. Rooms: Create Group Room
 app.post('/api/rooms/group', authenticateToken, async (req, res) => {
   try {
     const { name, description, avatarUrl, themeColor, members } = req.body;
@@ -449,7 +485,7 @@ app.post('/api/rooms/group', authenticateToken, async (req, res) => {
   }
 });
 
-// 12. Rooms: Create Room-to-Room Bridge
+// 13. Rooms: Create Room-to-Room Bridge
 app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
   try {
     const { sourceRoomId, targetRoomId } = req.body;
@@ -464,7 +500,7 @@ app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
   }
 });
 
-// 13. Messages: Get Messages for a Room
+// 14. Messages: Get Messages for a Room
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
     const messages = await db.getRoomMessages(req.params.roomId);
@@ -474,7 +510,29 @@ app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   }
 });
 
-// 14. Messages: Delete Message (Delete for Everyone)
+// 15. Messages: Post Message (REST Fallback)
+app.post('/api/messages', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, text, type, mediaUrl, replyToId } = req.body;
+    if (!roomId) return res.status(400).json({ error: 'roomId is required.' });
+
+    const msg = await db.createMessage({
+      roomId,
+      senderId: req.user.id,
+      text,
+      type: type || 'text',
+      mediaUrl,
+      replyToId
+    });
+
+    io.to(roomId).emit('new_message', msg);
+    res.status(201).json(msg);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to post message.' });
+  }
+});
+
+// 16. Messages: Delete Message (With Sender Ownership Check)
 app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   try {
     const deleted = await db.deleteMessage(req.params.messageId, req.user.id);
@@ -482,14 +540,14 @@ app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
       io.to(deleted.room_id).emit('message_deleted', req.params.messageId);
       res.json({ message: 'Message deleted.' });
     } else {
-      res.status(404).json({ error: 'Message not found or unauthorized.' });
+      res.status(403).json({ error: 'Unauthorized or message not found.' });
     }
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete message.' });
   }
 });
 
-// 15. Uploads: Attachment, Video, Image, Audio Voice Note, or Profile Photo Upload
+// 17. Uploads: Attachment, Video, Image, Audio Voice Note, or Profile Photo Upload
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
@@ -501,7 +559,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
   }
 });
 
-// 16. Statuses / Stories (Photos, Videos & Text Statuses)
+// 18. Statuses / Stories
 app.post('/api/statuses', authenticateToken, async (req, res) => {
   try {
     const { text, mediaUrl, mediaType, bgColor } = req.body;
@@ -542,7 +600,7 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
-// 17. Toggle Pin Chat
+// 19. Toggle Pin Chat
 app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   try {
     const isPinned = await db.togglePinChat(req.user.id, req.params.roomId);
@@ -552,7 +610,7 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   }
 });
 
-// 18. Add / Invite Friend by Email (Automatic Resend Email Dispatch for Unregistered Friends)
+// 20. Add / Invite Friend by Email
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body;
@@ -568,64 +626,53 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
       const room = await db.getOrCreatePrivateRoom(req.user.id, targetUser.id);
       notifyRoomCreated(io, room, [req.user.id, targetUser.id]);
       
-      // Dispatch Resend Notification Email to registered friend
+      const appUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
       const htmlText = `
-        <div style="font-family: 'Plus Jakarta Sans', Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.1);">
-          <div style="text-align: center; margin-bottom: 20px;">
-            <h1 style="color: #10b981; font-family: 'Outfit', sans-serif; margin: 0; font-size: 26px;">PulseRoom</h1>
-            <p style="color: #94a3b8; font-size: 14px; margin-top: 4px;">New Chat Notification</p>
-          </div>
-          <div style="background: rgba(255,255,255,0.05); padding: 20px; border-radius: 12px; text-align: center; border: 1px solid rgba(16,185,129,0.3);">
-            <p style="color: #e2e8f0; font-size: 15px; margin-bottom: 16px;">Hello <strong>${targetUser.username}</strong>,</p>
-            <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">Your friend <strong>${req.user.username}</strong> started a private chat with you on PulseRoom!</p>
-            <div style="margin: 20px 0;">
-              <a href="http://localhost:3000" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block;">Open PulseRoom Chat</a>
-            </div>
-          </div>
+        <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
+          <h1 style="color: #10b981;">PulseRoom</h1>
+          <p>Hello <strong>${targetUser.username}</strong>,</p>
+          <p>Your friend <strong>${req.user.username}</strong> started a private chat with you on PulseRoom!</p>
+          <a href="${appUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Open PulseRoom Chat</a>
         </div>
       `;
 
       sendEmail({
         to: cleanEmail,
         subject: `${req.user.username} started a private chat with you on PulseRoom!`,
-        plainText: `Hello ${targetUser.username}, your friend ${req.user.username} started a private chat with you. Open PulseRoom at http://localhost:3000`,
+        plainText: `Hello ${targetUser.username}, your friend ${req.user.username} started a private chat with you. Open PulseRoom at ${appUrl}`,
         htmlText
       });
 
       return res.json({
         status: 'user_found',
-        message: `Found ${targetUser.username}! Private chat initiated. Email notification dispatched!`,
+        message: `Found ${targetUser.username}! Private chat initiated. Notification sent.`,
         room
       });
     } else {
-      // DISPATCH RESEND INVITATION EMAIL TO UNREGISTERED FRIEND
+      const appUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
       const htmlText = `
-        <div style="font-family: 'Plus Jakarta Sans', Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.1);">
-          <div style="text-align: center; margin-bottom: 20px;">
-            <h1 style="color: #10b981; font-family: 'Outfit', sans-serif; margin: 0; font-size: 26px;">PulseRoom</h1>
-            <p style="color: #94a3b8; font-size: 14px; margin-top: 4px;">You've Been Invited to Join PulseRoom!</p>
-          </div>
-          <div style="background: rgba(255,255,255,0.05); padding: 20px; border-radius: 12px; text-align: center; border: 1px solid rgba(16,185,129,0.3);">
-            <p style="color: #e2e8f0; font-size: 15px; margin-bottom: 16px;">Hello,</p>
-            <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to connect and chat on <strong>PulseRoom Messenger</strong>.</p>
-            <div style="margin: 20px 0;">
-              <a href="http://localhost:3000" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block;">Accept Invitation & Sign Up</a>
-            </div>
-            <p style="color: #64748b; font-size: 12px;">Open PulseRoom app: <a href="http://localhost:3000" style="color: #38bdf8;">http://localhost:3000</a></p>
-          </div>
+        <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
+          <h1 style="color: #10b981;">PulseRoom</h1>
+          <p>Hello,</p>
+          <p>Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to connect on <strong>PulseRoom Messenger</strong>.</p>
+          <a href="${appUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Sign Up</a>
         </div>
       `;
 
-      await sendEmail({
+      const result = await sendEmail({
         to: cleanEmail,
         subject: `Your friend ${req.user.username} invited you to join PulseRoom Messenger!`,
-        plainText: `Hello! Your friend ${req.user.username} (${req.user.email}) invited you to join PulseRoom. Register at http://localhost:3000`,
+        plainText: `Your friend ${req.user.username} invited you to join PulseRoom: ${appUrl}`,
         htmlText
       });
 
+      if (!result.success) {
+        return res.status(500).json({ error: 'Failed to send invitation email.' });
+      }
+
       return res.json({
         status: 'invited',
-        message: `Invitation email successfully dispatched to ${cleanEmail} via Resend API!`
+        message: `Invitation email dispatched to ${cleanEmail}!`
       });
     }
   } catch (err) {

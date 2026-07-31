@@ -13,6 +13,16 @@ export default function ProfileModal({ isOpen, onClose }) {
   const [successMsg, setSuccessMsg] = useState('');
   const [error, setError] = useState('');
 
+  React.useEffect(() => {
+    if (isOpen && user) {
+      setUsername(user.username || '');
+      setBio(user.bio || '');
+      setAvatarUrl(user.avatar_url || '');
+      setError('');
+      setSuccessMsg('');
+    }
+  }, [isOpen, user]);
+
   if (!isOpen) return null;
 
   // Handle Profile Photo Upload (WhatsApp Photo Picker)

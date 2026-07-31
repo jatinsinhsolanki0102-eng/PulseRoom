@@ -1,0 +1,321 @@
+================================================================================
+ PULSEROOM CHAT APP - FULL PROJECT ISSUE REPORT
+ Generated: 31-Jul-2026
+ Scope: Whole project (server, api/vercel, client, config)
+ NOTE: No code was changed. This is a read-only report.
+================================================================================
+
+----------------------------------------------------------------------
+SECTION A - CONFIRMATION EMAIL SENDING (MAIN PROBLEM AREA)
+----------------------------------------------------------------------
+
+A1. CONFIRMATION LINK POINTS TO "localhost:5000" (CRITICAL)
+    File : server/src/server.js, line 216
+    Code : const confirmLink = `http://localhost:5000/api/auth/confirm-email?email=...`;
+    Problem: The email that is sent to the user contains a link that
+    points to localhost:5000. When the user opens this email on their
+    phone / another PC, the link opens THEIR OWN machine, so the
+    confirmation always fails. This works ONLY if the person reads the
+    email on the same machine that is running the backend.
+    Same problem: server/src/server.js line 284 (success page "Return to
+    PulseRoom Login" points to http://localhost:3000), and lines 582/591,
+    612/614/622 (friend-invite emails point to http://localhost:3000).
+    Fix idea: Use a real public URL / an environment variable like
+    APP_URL instead of hardcoding localhost.
+
+A2. RESEND SANDBOX SENDER "onboarding@resend.dev" (CRITICAL)
+    Files: server/src/server.js line 66, api/index.js line 148
+    Code : from: 'PulseRoom Messenger <onboarding@resend.dev>'
+    Problem: Resend's default sender domain (onboarding@resend.dev) is a
+    SANDBOX. Until you verify your own sending domain in Resend, it can
+    only deliver emails to the Resend account owner's own email address.
+    Every confirmation email sent to a real user (not the account owner)
+    is rejected / never delivered. The code still treats the API response
+    as success ("Confirmation email dispatched"), so nobody notices.
+    Fix idea: Verify a domain in Resend (e.g. yourdomain.com) and use
+    from: 'PulseRoom <noreply@yourdomain.com>', OR skip Resend and use
+    the Gmail SMTP path directly.
+
+A3. ETHEREAL TEST-MAIL FALLBACK REPORTS SUCCESS BUT USER NEVER GETS MAIL
+    File: server/src/server.js lines 113-129
+    Problem: If Resend AND Gmail SMTP both fail, the code falls back to
+    nodemailer Ethereal (a fake/test inbox). It returns { success: true }
+    with only a previewUrl. The preview URL is printed to the server
+    console but never shown to the user, so the UI says "Confirmation
+    email dispatched" while the user receives NOTHING.
+
+A4. EMAIL SEND FAILURE IS IGNORED - API RETURNS 201 ANYWAY
+    Files: server/src/server.js lines 234-245, api/index.js lines 252-263
+    Problem: The register endpoints never check the result of sendEmail().
+    Even if every mail provider fails (success: false), the API returns
+    201 with "Confirmation email dispatched to ...". The user is told to
+    check their inbox, but no mail was ever sent.
+    Fix idea: Check result.success, and if false, return a clear error /
+    allow re-sending the confirmation mail.
+
+A5. api/index.js NEVER LOADS ENVIRONMENT VARIABLES
+    File: api/index.js (whole file - no import 'dotenv')
+    Problem: The Vercel function does not load dotenv and server/.env
+    only exists inside the server/ folder. On Vercel the env vars
+    (RESEND_API_KEY etc.) will be undefined unless manually configured
+    in the Vercel dashboard. As a result the hardcoded fallback Gmail
+    credentials are used, or if those fail, email silently fails.
+
+A6. HARDCODED GMAIL CREDENTIALS AS FALLBACK (SECURITY + RELIABILITY)
+    File: api/index.js lines 135-136
+    Code : GMAIL_USER = process.env.GMAIL_USER || 'user@example.com'
+           GMAIL_APP_PASS = process.env.GMAIL_APP_PASS || 'bnxxglavytopcmxn'
+    Problem: If the Gmail app password is invalid, Google blocks sign-in,
+    or 2FA/less-secure-apps settings change, Gmail SMTP throws an error
+    that is only console.warn'ed. The user gets no email and no error.
+    Also committing an app password into source is a serious secret leak
+    (see Section E).
+
+A7. NO TOKEN IN THE CONFIRMATION LINK (INSECURE CONFIRMATION)
+    Files: server/src/server.js lines 216/258-292, api/index.js lines 242/271-294
+    Problem: The confirmation link is just
+    /api/auth/confirm-email?email=xyz - there is no one-time token or
+    signed payload. Anyone who knows (or guesses) an email address can
+    mark that account as confirmed by opening the URL. Combined with the
+    register endpoint, this is not a real "ownership" proof.
+
+A8. CLIENT register() IN AuthContext STORES AN UNDEFINED TOKEN (BUG)
+    File: client/src/context/AuthContext.jsx lines 51-64
+    Code : localStorage.setItem('pulseroom_token', data.token);  // data.token is undefined
+           setToken(data.token);
+    Problem: The /api/auth/register endpoints do NOT return a token or
+    user (they return { message, email, ... }). So this helper writes the
+    string "undefined" into localStorage, then auto-login via /api/users/me
+    fails with 401 and the user is logged out. (AuthModal.jsx does not use
+    this function - it uses fetch directly - so the bug is latent, but the
+    function is broken if ever used.)
+
+A9. DEAD "INSTANT CONFIRM" BUTTON HANDLER
+    File: client/src/components/auth/AuthModal.jsx lines 71-84
+    Problem: handleInstantConfirm() is defined but no button ever calls
+    it. The "email-sent" screen only has "Go to Sign In". Dead code.
+
+A10. BREVO API KEY IS READ BUT NEVER USED
+    File: server/src/server.js line 50
+    Code : const brevoApiKey = (process.env.BREVO_API_KEY || ...)  -> never used after this
+    Problem: The Brevo key from server/.env is loaded but there is no
+    Brevo dispatch branch in sendEmail(). Dead code / missing provider.
+
+A11. REGISTER MESSAGE ALWAYS CLAIMS RESEND WAS USED
+    File: client/src/components/auth/AuthModal.jsx line 301
+    Code : "We dispatched an email via Resend to ..."
+    Problem: Even when Resend failed and Gmail/Ethereal handled it, the
+    UI tells the user Resend was used. Misleading message.
+
+----------------------------------------------------------------------
+SECTION B - BACKEND (server/src/server.js)
+----------------------------------------------------------------------
+
+B1. FORGOT-PASSWORD CALLS A FUNCTION THAT DOES NOT EXIST (CRASH ON VERCEL)
+    File: api/index.js line 353
+    Code : await resetUserPassword(cleanEmail, newHash);
+    Problem: resetUserPassword is never defined in api/index.js. When a
+    user submits a new password on Vercel this throws a ReferenceError,
+    caught by the try/catch, and the API always returns 500
+    "Failed to process password reset." -> Password reset is fully broken
+    on the deployed (Vercel) version.
+
+B2. UNUSED pendingPasswordResets MAP
+    File: server/src/server.js line 22
+    Problem: Declared but never used. Leftover from an earlier design.
+
+B3. HACKY /api/auth/send-otp ALIAS
+    File: server/src/server.js lines 253-255
+    Code : return app._router.handle({ ...req, url: '/api/auth/register' }, res);
+    Problem: Uses Express internals (app._router.handle). Fragile and may
+    break on Express upgrades. There is also no /api/auth/send-otp in the
+    client, so it is dead code.
+
+B4. sendEmail() CALLS dotenv.config({ override: true }) ON EVERY SEND
+    File: server/src/server.js line 44
+    Problem: Re-loads .env on every email send (inefficient, unnecessary).
+
+B5. USERS TABLE DEFAULT email_confirmed = TRUE
+    File: server/src/db.js line 46
+    Code : email_confirmed BOOLEAN DEFAULT TRUE
+    Problem: Any row inserted without an explicit value becomes confirmed.
+    The app always passes the value explicitly, but the DB default
+    undermines the "strict email confirmation" design.
+
+B6. deleteMessage() DOES NOT CHECK OWNERSHIP (DELETE ANYONE'S MESSAGE)
+    File: server/src/db.js lines 622-635
+    Code (PG): DELETE FROM messages WHERE id = $1   (no sender_id check)
+    Code (memory): no user check either
+    Problem: Any authenticated user who knows a message id can delete it
+    "for everyone", even if they are not the sender.
+
+B7. PINNED CHATS ARE ONLY STORED IN MEMORY
+    File: server/src/db.js lines 481-490 (togglePinChat), 436/447 (reads)
+    Problem: When PostgreSQL is connected, pins are still written to the
+    in-memory Set and are lost on server restart.
+
+B8. supabase.js MODULE IS NEVER USED
+    File: server/src/supabase.js (entire file)
+    Problem: The module is created but never imported anywhere. Dead code.
+
+B9. SOCKET EVENTS ARE NOT AUTHENTICATED
+    File: server/src/socketHandler.js lines 45-95
+    Problem: The client freely emits 'send_message' with any senderId;
+    there is no handshake token verification. A connected client can
+    send messages impersonating other users.
+
+----------------------------------------------------------------------
+SECTION C - CLIENT (client/src)
+----------------------------------------------------------------------
+
+C1. NO ERROR HANDLING / MESSAGE SHOWN WHEN EMAIL FAILS (see A4)
+    File: client/src/components/auth/AuthModal.jsx lines 45-68
+    Problem: The register form only checks res.ok (which is 201 even when
+    no email was sent). No feedback that the mail could not be sent.
+
+C2. LOCALSTORAGE SEEN-STATUS SIZE GROWS FOREVER
+    File: client/src/components/status/StatusTray.jsx lines 12-19, 52-62
+    Problem: Every status id is kept forever in localStorage
+    (pulseroom_seen_statuses). Over time this grows without bound.
+
+C3. statuses view: progress interval may double / leak on quick navigation
+    File: client/src/components/status/StatusTray.jsx lines 148-173
+    Problem: The effect depends on [currentIndex, viewingQueue]; the
+    cleanup clears progressIntervalRef.current but handleNextStory() is
+    called from inside setProgress callback while clearing, which can
+    cause timing quirks. Minor.
+
+C4. ProfileModal state does not reset when the modal reopens
+    File: client/src/components/profile/ProfileModal.jsx lines 8-14
+    Problem: username/bio/avatarUrl are initialized from user once; if the
+    modal is reopened after a profile change, the local state may be stale.
+
+C5. MessageList has no virtualization
+    File: client/src/components/chat/MessageList.jsx
+    Problem: Renders every message in the room; very long chats will get
+    slow.
+
+----------------------------------------------------------------------
+SECTION D - DEPLOYMENT / VERCEL MISMATCH (BIGGEST ARCHITECTURAL GAP)
+----------------------------------------------------------------------
+
+D1. api/index.js IS MISSING MOST OF THE CLIENT'S ENDPOINTS
+    File: api/index.js (route inventory)
+    The client calls these but api/index.js has NO route for them:
+      - POST /api/rooms/group          (CreateGroupModal.jsx)
+      - POST /api/rooms/bridge         (GroupBridgeModal.jsx)
+      - GET  /api/rooms/:roomId/messages (App.jsx fetchRoomMessages)
+      - DELETE /api/messages/:messageId  (App.jsx handleDeleteMessage)
+      - PUT  /api/rooms/:roomId/pin    (App.jsx handleTogglePin)
+      - PUT  /api/users/theme          (ThemeContext.jsx)
+      - POST /api/upload               (ChatComposer, ProfileModal, CreateStatusModal)
+      - POST /api/statuses             (CreateStatusModal.jsx)
+      - DELETE /api/statuses/:statusId (StatusTray.jsx)
+    On Vercel all of these return 404/500 via the catch-all error handler.
+    Result: the deployed app cannot create groups/bridges, cannot load
+    message history, cannot delete messages, cannot pin chats, cannot
+    upload photos/voice notes/statuses, and cannot save themes.
+
+D2. NO SOCKET.IO ON THE DEPLOYED (VERCEL) VERSION
+    File: api/index.js (no socket.io anywhere); socket only in server/src/server.js
+    Problem: All real-time messaging goes over socket 'send_message'
+    (SocketContext.jsx sendMessage). The Vercel deployment has no
+    WebSocket server, so users cannot actually SEND messages on the
+    deployed app. There is also no REST fallback for sending messages.
+
+D3. HARDCODED DEPLOYED URL https://pulse-room-chat-app.vercel.app
+    File: api/index.js lines 242, 286, 468
+    Problem: The confirmation link, the success page link and the friend
+    invite link all hardcode this URL. If the project is deployed under a
+    different Vercel name, every email link is wrong. Should be an env var.
+
+D4. /uploads IS NOT SERVED ON VERCEL
+    Problem: Uploaded files get mediaUrl like "/uploads/xxx.png"
+    (server.js line 496) but the deployed api/index.js neither accepts
+    uploads nor serves static files, so images / voice notes / avatars
+    appear broken in production.
+
+D5. UPLOADS DIRECTORY DEPENDS ON CWD
+    File: server/src/server.js line 144  path.resolve('uploads')
+    Problem: If the server is started from the repo root instead of the
+    server/ folder, the uploads dir is created in the wrong place. Prefer
+    path relative to the module file.
+
+D6. root package.json build script uses "cd client && npm install"
+    File: package.json line 6
+    Problem: On Vercel, running npm install inside a subfolder inside the
+    build step can conflict with Vercel's own install step and monorepo
+    detection. Cleaner: put the build in client/package.json and set
+    vercel.json buildCommand accordingly.
+
+D7. CORS WIDE OPEN origin: '*'
+    Files: api/index.js line 191, server/src/server.js lines 135-139
+    Problem: Any website can call the API. Should restrict to the app URL.
+
+----------------------------------------------------------------------
+SECTION E - SECURITY / SECRET LEAKS
+----------------------------------------------------------------------
+
+E1. REAL CREDENTIALS HARDCODED IN COMMITTED CODE
+    File: api/index.js (committed to git)
+      - line 7:  JWT_SECRET fallback 'REDACTED_JWT_SECRET'
+      - line 8-9: Supabase URL + anon key (anon key is public by design,
+                 but it is still committed and bound to this project)
+      - line 136: Gmail APP PASSWORD 'bnxxglavytopcmxn' (a real secret!)
+    Anyone with repo access can send email as that Gmail account and
+    forge JWT tokens.
+
+E2. HARDCODED JWT FALLBACK SECRET
+    File: server/src/auth.js line 4
+    Problem: Same default JWT secret in two places (api/index.js and
+    auth.js). If env is not set, tokens can be forged.
+
+E3. NO CONFIRMATION TOKEN (see A7) + NO RESEND/RATE LIMITING
+    Problem: Confirmation endpoint can be spammed / abused to confirm
+    arbitrary emails. No rate limit on register/login/forgot-password.
+
+----------------------------------------------------------------------
+SECTION F - MINOR / CODE QUALITY
+----------------------------------------------------------------------
+
+F1. NODEMAILER VERSION MISMATCH BETWEEN PACKAGE FILES
+    Root package.json line 14: nodemailer ^6.9.13
+    server/package.json line 19: nodemailer ^9.0.3
+    The Vercel function (api/index.js) is built with the root dependency
+    (v6), the local server with v9. Keep them in sync.
+
+F2. NO LINT / TYPE CHECK / TEST SCRIPTS
+    No ESLint/Prettier config, no tests, no CI. Hard to catch the above
+    issues automatically.
+
+F3. AuthModal "email-sent" screen does not allow re-sending the email
+    File: client/src/components/auth/AuthModal.jsx lines 281-313
+    Problem: If the email is lost or fails to send, the only option is to
+    register again with the same email (which returns "already exists").
+
+F4. register endpoint has no "resend confirmation email" endpoint
+    A user who lost the confirmation mail cannot request a new one.
+
+F5. Comment/log noise and mixed hardcoded values
+    Files: server.js lines 216/284/582/591/612/614/622 (localhost URLs),
+    api/index.js (hardcoded Vercel URL).
+    All URLs should come from a single configuration / env var.
+
+================================================================================
+ SUMMARY OF THE "CONFIRMATION MAIL" ROOT CAUSES (most likely fixes)
+================================================================================
+ 1) The link inside the email uses http://localhost:5000 (server/src/server.js:216)
+    -> change to the real public URL (e.g. https://<your-app>.vercel.app or an APP_URL env var).
+ 2) Resend is configured with the sandbox sender onboarding@resend.dev, which only
+    delivers to the account owner (server.js:66, api/index.js:148).
+    -> verify a domain in Resend or let Gmail SMTP handle delivery.
+ 3) If Gmail SMTP fails, Ethereal "succeeds" but nothing is delivered (server.js:113-129),
+    and the API still returns 201 with "Confirmation email dispatched" (server.js:241,
+    api/index.js:259).
+    -> check sendEmail result and surface failures; log Gmail SMTP errors properly.
+ 4) On Vercel the env vars are not loaded (no dotenv, .env only in server/), so the
+    hardcoded Gmail credentials are the only path (api/index.js:134-136).
+    -> configure env vars in the Vercel dashboard and remove hardcoded secrets.
+================================================================================
+ END OF REPORT
+================================================================================

@@ -48,12 +48,13 @@ export default function StatusTray({ onOpenCreateStatus }) {
     };
   }, [socket]);
 
-  // Save seen statuses to localStorage
+  // Save seen statuses to localStorage (capped at 200 max)
   const markStatusSeen = (statusId) => {
     setSeenStatusIds(prev => {
-      const updated = new Set(prev).add(statusId);
+      const arr = Array.from(new Set(prev).add(statusId)).slice(-200);
+      const updated = new Set(arr);
       try {
-        localStorage.setItem('pulseroom_seen_statuses', JSON.stringify(Array.from(updated)));
+        localStorage.setItem('pulseroom_seen_statuses', JSON.stringify(arr));
       } catch (e) {
         console.warn('LocalStorage save warning:', e);
       }

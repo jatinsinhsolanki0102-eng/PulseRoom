@@ -42,9 +42,11 @@ export function AuthProvider({ children }) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Login failed.');
     
-    localStorage.setItem('pulseroom_token', data.token);
-    setToken(data.token);
-    setUser(data.user);
+    if (data.token) {
+      localStorage.setItem('pulseroom_token', data.token);
+      setToken(data.token);
+      setUser(data.user);
+    }
     return data.user;
   };
 
@@ -57,10 +59,12 @@ export function AuthProvider({ children }) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Registration failed.');
 
-    localStorage.setItem('pulseroom_token', data.token);
-    setToken(data.token);
-    setUser(data.user);
-    return data.user;
+    if (data.token) {
+      localStorage.setItem('pulseroom_token', data.token);
+      setToken(data.token);
+      setUser(data.user);
+    }
+    return data;
   };
 
   const logout = () => {
