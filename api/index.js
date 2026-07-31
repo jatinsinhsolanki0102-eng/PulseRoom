@@ -370,11 +370,13 @@ app.get('/api/auth/confirm-email', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    if (token) {
-      const verification = verifyConfirmationToken(token);
-      if (!verification.valid || verification.email !== cleanEmail) {
-        return res.status(400).send('Invalid or expired confirmation link.');
-      }
+    if (!token) {
+      return res.status(400).send('Confirmation token missing. Please use the link sent to your email.');
+    }
+
+    const verification = verifyConfirmationToken(token);
+    if (!verification.valid || verification.email !== cleanEmail) {
+      return res.status(400).send('Invalid or expired confirmation link.');
     }
 
     await markEmailConfirmed(cleanEmail);

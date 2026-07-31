@@ -1,0 +1,272 @@
+================================================================================
+ PULSEROOM CHAT APP - POST-FIX AUDIT & VERIFICATION REPORT
+ Date      : 31-Jul-2026
+ Scope     : Re-verification of every issue listed in PROJECT_ISSUES.txt
+ Result    : 21 RESOLVED / 8 PARTIALLY RESOLVED / 11 NOT RESOLVED
+ NOTE      : This is a read-only code audit. No files were changed.
+================================================================================
+
+SUMMARY TABLE
+-------------
+  RESOLVED         : A1, A4, A5, A6, A8, A9, A10, A11, B1, B2, B3, B4, B5, B6,
+                     C1, C2, C4, D3, D5, F3, F4                        (21)
+  PARTIAL          : A2, A3, A7, D1, D2, E1, E3, F5                     (8)
+  NOT RESOLVED     : B7, B8, B9, C3, C5, D4, D6, D7, E2, F1, F2        (11)
+
+NOTE ON CLAIM: The fix report claims "all 32 issues resolved and tested."
+The original PROJECT_ISSUES.txt actually lists 40 issues (A1-A11, B1-B9,
+C1-C5, D1-D7, E1-E3, F1-F5). The verification below shows 19 of those are
+NOT fully resolved. Items marked NOT RESOLVED below will still fail or
+still leak in production.
+
+================================================================================
+SECTION A - CONFIRMATION EMAIL & DISPATCH SYSTEM
+================================================================================
+
+A1. HARDCODED localhost:5000 CONFIRMATION LINKS .......... RESOLVED
+    server/src/server.js:202 -> baseUrl = APP_URL || req.protocol + req.get('host')
+    api/index.js:285          -> same dynamic base URL
+    Friend-invite links also dynamic (server.js:629, 652).
+    Remaining "http://localhost:3000" (server.js:304) is only a final dev
+    fallback for CLIENT_URL/APP_URL and is acceptable.
+
+A2. RESEND SANDBOX SENDER onboarding@resend.dev ........... PARTIAL
+    Still hardcoded in server.js:59 and api/index.js:190.
+    FIXED IN PRACTICE ONLY IF GMAIL_USER/GMAIL_APP_PASS are configured:
+    Resend fails silently for non-owner recipients, then Gmail SMTP
+    (Priority 2) delivers to anyone. If ONLY Resend is configured in the
+    .env / Vercel dashboard, emails to real users still fail.
+    -> Set Gmail env vars, or verify a Resend sending domain.
+
+A3. ETHEREAL FALLBACK REPORTS SUCCESS BUT NO MAIL ........ PARTIAL
+    server.js:102-118 still falls back to Ethereal (test inbox) and returns
+    { success:true } with only a previewUrl. If Resend + Gmail BOTH fail,
+    the API still returns 201 (server.js:236) and the UI says "dispatched"
+    while the user receives nothing. previewUrl is returned (server.js:239)
+    but AuthModal never shows it.
+    -> Remove the Ethereal branch or surface previewUrl in the UI as a
+       hard "NOT DELIVERED" state instead of success.
+
+A4. EMAIL FAILURE IGNORED - API RETURNS 201 ANYWAY ....... RESOLVED
+    server.js:230-234 and api/index.js:305-309 now check result.success
+    and return 500 with a clear error when all providers fail.
+
+A5. api/index.js NEVER LOADS ENV VARS .................... RESOLVED
+    dotenv is not needed on Vercel (env vars come from the dashboard).
+    The old hardcoded Gmail fallback that silently masked missing env is
+    removed, so missing env now surfaces as an error instead.
+
+A6. HARDCODED GMAIL CREDENTIALS .......................... RESOLVED
+    The app password 'bnxxglavytopcmxn' is gone from the codebase
+    (verified by grep). Both files now read process.env.GMAIL_USER /
+    process.env.GMAIL_APP_PASS with empty fallback.
+
+A7. NO TOKEN IN CONFIRMATION LINK ........................ PARTIAL
+    Tokens ARE now generated and verified (server.js:203-204, 296-301;
+    api/index.js:35-53, 286-287, 373-378; signed 24h JWT).
+    BUT the claim "unsigned requests are rejected" is FALSE:
+      server.js:296   ->  if (token) { ...verify... }   then ALWAYS confirm
+      api/index.js:373 ->  same pattern
+    A request to /api/auth/confirm-email?email=any@email.com WITH NO TOKEN
+    still confirms the account. The endpoint must REQUIRE a valid token.
+    -> Change "if (token)" to "if (!token) return 400".
+
+A8. AuthContext register() STORES UNDEFINED TOKEN ........ RESOLVED
+    client/src/context/AuthContext.jsx:62-66 now guards with if (data.token).
+
+A9. DEAD "INSTANT CONFIRM" BUTTON HANDLER ................ RESOLVED
+    handleInstantConfirm removed; replaced by a working
+    handleResendConfirmation that is wired to the button.
+
+A10. BREVO KEY READ BUT NEVER USED ....................... RESOLVED
+    BREVO_API_KEY no longer loaded anywhere (dead code removed).
+
+A11. MESSAGE ALWAYS CLAIMS RESEND WAS USED ............... RESOLVED
+    AuthModal.jsx:61 now shows data.message from the server, which no
+    longer names a specific provider.
+
+================================================================================
+SECTION B - BACKEND / SECURITY
+================================================================================
+
+B1. resetUserPassword() MISSING ON VERCEL (CRASH) ........ RESOLVED
+    api/index.js:153 implements resetUserPassword() incl. Supabase PATCH.
+
+B2. UNUSED pendingPasswordResets MAP ..................... RESOLVED
+    Removed from server.js.
+
+B3. HACKY /api/auth/send-otp ALIAS ....................... RESOLVED
+    The app._router.handle hack is removed.
+
+B4. dotenv.config({override:true}) ON EVERY SEND .......... RESOLVED
+    dotenv.config() now runs once (server.js:15). sendEmail() does not
+    reload it.
+
+B5. DB DEFAULT email_confirmed = TRUE .................... RESOLVED
+    db.js:46 -> email_confirmed BOOLEAN DEFAULT FALSE.
+    Minor: db.createUser() param default is still emailConfirmed = true
+    (db.js:133); callers pass false explicitly, so behavior is correct,
+    but the default should be flipped to false for safety.
+
+B6. deleteMessage() NO OWNERSHIP CHECK ................... RESOLVED
+    db.js:624 -> DELETE ... WHERE id = $1 AND sender_id = $2 (PG).
+    Memory path also checks sender_id (db.js:628). Vercel route returns
+    403 when the sender does not match (api/index.js:648).
+
+B7. PINNED CHATS ONLY IN MEMORY .......................... NOT RESOLVED
+    db.js:481-490 togglePinChat() still writes ONLY to
+    memoryDb.pinned_chats (a Set). No persistence to
+    theme_preferences.pinned_rooms or any table was implemented, despite
+    the fix report claiming it. Pins are still lost on restart.
+    -> Add a pinned_rooms column/JSONB field to users/theme_preferences
+       and read it in getUserRooms().
+
+B8. supabase.js MODULE NEVER USED ........................ NOT RESOLVED
+    server/src/supabase.js is still not imported anywhere (verified by
+    grep). Dead code. Import + use it or delete the file.
+
+B9. SOCKET EVENTS NOT AUTHENTICATED ...................... NOT RESOLVED
+    socketHandler.js:45-95 still trusts client-supplied senderId on
+    'send_message'. No handshake token verification (only a plain
+    user_connected event with a user id). Any connected client can
+    impersonate another user or spam a room.
+    -> Add token auth to socket.io handshake and drop the
+       client-supplied senderId.
+
+================================================================================
+SECTION C - CLIENT
+================================================================================
+
+C1. NO ERROR MESSAGE WHEN EMAIL FAILS .................... RESOLVED
+    AuthModal.jsx:59 throws data.error when res is not ok; server now
+    returns 500 on dispatch failure (see A4), so the UI shows the reason.
+
+C2. LOCALSTORAGE SEEN-STATUS GROWS FOREVER ............... RESOLVED
+    StatusTray.jsx:52-63 caps the array at 200 items (.slice(-200)).
+
+C3. STATUS PROGRESS INTERVAL DOUBLE/LEAK ................. NOT RESOLVED
+    StatusTray.jsx:149-174 is unchanged from the original report
+    (same effect deps [currentIndex, viewingQueue], same
+    handleNextStory() call inside the setProgress callback).
+    No fix applied. Minor, but claim of "resolved" is inaccurate.
+
+C4. ProfileModal STATE DOES NOT RESET ON REOPEN .......... RESOLVED
+    ProfileModal.jsx:16-24 now syncs username/bio/avatarUrl whenever
+    isOpen or user changes.
+
+C5. MessageList NO VIRTUALIZATION ........................ NOT RESOLVED
+    MessageList.jsx still renders every message in the room. Very long
+    chats will get slow. No virtualization/windowing added.
+
+================================================================================
+SECTION D - DEPLOYMENT / VERCEL PARITY
+================================================================================
+
+D1. api/index.js MISSING CLIENT ENDPOINTS ................ PARTIAL
+    Now present: POST /api/rooms/group (551), POST /api/rooms/bridge (578),
+    GET /api/rooms/:roomId/messages (602), DELETE /api/messages/:messageId (643),
+    PUT /api/rooms/:roomId/pin (588), PUT /api/users/theme (506),
+    POST /api/statuses (671), DELETE /api/statuses/:statusId (696).
+    STILL MISSING: POST /api/upload (no upload route exists in api/index.js).
+    Profile photo / image / voice-note uploads therefore still fail on Vercel.
+
+D2. NO SOCKET.IO / NO MESSAGE SEND ON VERCEL ............ PARTIAL
+    REST fallback POST /api/messages exists server-side (api/index.js:611).
+    BUT the client never uses it: SocketContext.jsx:61-72 emits
+    'send_message' over the socket only. On Vercel there is no socket
+    server, so the UI still cannot send messages.
+    -> In SocketContext.sendMessage(), if socket is missing/disconnected,
+       POST to /api/messages instead.
+
+D3. HARDCODED https://pulse-room-chat-app.vercel.app ...... RESOLVED
+    All links now use process.env.APP_URL (api/index.js:285,335,738).
+    No hardcoded Vercel URL remains (verified by grep).
+
+D4. /uploads NOT SERVED ON VERCEL ....................... NOT RESOLVED
+    api/index.js has no static /uploads handler and no upload endpoint
+    (see D1). Files would appear broken in production.
+    -> Requires a blob/object store (e.g. Supabase Storage) since serverless
+       disk writes do not persist anyway.
+
+D5. UPLOADS DIR DEPENDS ON CWD .......................... RESOLVED
+    server.js:133 -> path.resolve(process.cwd(), 'uploads').
+
+D6. ROOT BUILD SCRIPT "cd client && npm install" ......... NOT RESOLVED
+    package.json:6 is unchanged. This can conflict with Vercel's monorepo
+    / install detection.
+    -> Move build to client/package.json and point vercel.json
+       buildCommand at it.
+
+D7. CORS WIDE OPEN origin:'*' ............................ NOT RESOLVED
+    api/index.js:233 and server.js:125 still allow every origin.
+    -> Restrict to the app URL (CLIENT_URL/APP_URL) with credentials.
+
+================================================================================
+SECTION E - SECURITY / SECRET LEAKS
+================================================================================
+
+E1. REAL CREDENTIALS HARDCODED IN COMMITTED CODE ......... PARTIAL
+    GMAIL APP PASSWORD  : REMOVED (no longer present anywhere).
+    JWT_SECRET fallback : STILL PRESENT, see E2.
+    Supabase URL + anon key: still committed as fallbacks
+    (api/index.js:8-9). The anon key is public by design (RLS is the real
+    protection), but the hardcoded fallback should be removed so a typo in
+    env config doesn't silently fall back to this project's key.
+
+E2. HARDCODED JWT FALLBACK SECRET ........................ NOT RESOLVED
+    Same fallback secret 'pulseroom_super_secret_jwt_key_2026' in BOTH
+    api/index.js:7 and server/src/auth.js:4. If JWT_SECRET env is unset,
+    anyone with repo access can forge auth + confirmation tokens.
+    -> Remove the fallback and fail fast when JWT_SECRET is missing.
+
+E3. NO CONFIRMATION TOKEN GUARD + NO RATE LIMITING ....... PARTIAL
+    Token added (see A7 caveat - still not enforced). Rate limiting on
+    register/login/forgot-password/resend is NOT implemented (no
+    express-rate-limit dependency).
+
+================================================================================
+SECTION F - MINOR / CODE QUALITY
+================================================================================
+
+F1. NODEMAILER VERSION MISMATCH .......................... NOT RESOLVED
+    package.json:14 -> nodemailer ^6.9.13  (Vercel build)
+    server/package.json:19 -> nodemailer ^9.0.3  (local server)
+    Still out of sync.
+
+F2. NO LINT / TYPE CHECK / TEST SCRIPTS .................. NOT RESOLVED
+    No ESLint/Prettier config, no test runner, no CI config added.
+
+F3. "EMAIL-SENT" SCREEN CANNOT RESEND .................... RESOLVED
+    AuthModal.jsx:325-334 adds "Didn't get email? Resend Confirmation
+    Link" calling handleResendConfirmation.
+
+F4. NO RESEND-CONFIRMATION ENDPOINT ...................... RESOLVED
+    POST /api/auth/resend-confirmation added in server.js:248 and
+    api/index.js:323.
+
+F5. COMMENT/LOG NOISE + MIXED HARDCODED URLS ............. PARTIAL
+    Dynamic env URLs are now the primary path. Remaining localhost
+    strings are dev-only fallbacks (server.js:304 clientUrl,
+    SocketContext.jsx:21 socket URL) - acceptable for local dev but there
+    is still no single centralised URL config module.
+
+================================================================================
+TOP PRIORITY ACTIONS (to actually close the remaining gaps)
+================================================================================
+ 1) A7/E3: Require the JWT token in /api/auth/confirm-email -
+    reject requests with NO token (server.js:296, api/index.js:373).
+ 2) E2: Remove hardcoded JWT fallback secret in auth.js:4 and api/index.js:7.
+ 3) D2: Make client fall back to POST /api/messages when socket is down.
+ 4) D1/D4: Add upload handling (or Supabase Storage) on Vercel.
+ 5) B7: Persist pinned rooms to DB/theme_preferences.
+ 6) B9: Authenticate socket.io handshake with the JWT.
+ 7) A2/A3: Configure Gmail env vars (or verify Resend domain) and stop
+    treating Ethereal as success.
+ 8) D7: Lock down CORS to the app origin.
+ 9) F1: Align nodemailer versions; D6: fix root build script.
+10) Cleanup: delete/use supabase.js (B8), add rate limiting (E3),
+    optional virtualization (C5) and lint/tests (F2).
+
+================================================================================
+END OF AUDIT VERIFICATION REPORT
+================================================================================

@@ -1,38 +1,58 @@
+import jwt from 'jsonwebtoken';
 import { db } from './db.js';
 
 // Active connected sockets tracking
 const userSockets = new Map(); // userId -> Set<socketId>
 
+const getJwtSecret = () => process.env.JWT_SECRET || '';
+
 export function setupSocketHandlers(io) {
+  // Authentication Middleware for Socket.IO Handshake
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, getJwtSecret());
+        if (decoded && decoded.id) {
+          socket.userId = decoded.id;
+        }
+      } catch (e) {
+        console.warn('Socket auth token verify failed:', e.message);
+      }
+    }
+    next();
+  });
+
   io.on('connection', (socket) => {
-    let currentUserId = null;
+    let currentUserId = socket.userId || null;
 
     // 1. Authenticate & Bind User Session
     socket.on('user_connected', async (userId) => {
-      if (!userId) return;
-      currentUserId = userId;
-      socket.userId = userId;
+      const boundUserId = socket.userId || userId;
+      if (!boundUserId) return;
+      currentUserId = boundUserId;
+      socket.userId = boundUserId;
 
-      if (!userSockets.has(userId)) {
-        userSockets.set(userId, new Set());
+      if (!userSockets.has(boundUserId)) {
+        userSockets.set(boundUserId, new Set());
       }
-      userSockets.get(userId).add(socket.id);
+      userSockets.get(boundUserId).add(socket.id);
 
-      // Join personal user room for direct user notifications
-      socket.join(`user:${userId}`);
+      // Join personal user room for direct notifications
+      socket.join(`user:${boundUserId}`);
 
       // Update online status in database
-      await db.updateUserStatus(userId, 'online');
+      await db.updateUserStatus(boundUserId, 'online');
 
       // Join user to all their room channels
-      const rooms = await db.getUserRooms(userId);
+      const rooms = await db.getUserRooms(boundUserId);
       for (const room of rooms) {
         socket.join(room.id);
       }
 
       // Broadcast presence update to all connected clients
-      io.emit('user_presence', { userId, status: 'online' });
-      console.log(`🔌 User connected socket: ${userId} (${socket.id})`);
+      io.emit('user_presence', { userId: boundUserId, status: 'online' });
+      console.log(`🔌 User connected socket: ${boundUserId} (${socket.id})`);
     });
 
     // 2. Join specific room dynamic channel
@@ -41,10 +61,11 @@ export function setupSocketHandlers(io) {
       console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
     });
 
-    // 3. Handle Real-Time Messaging (Direct 1:1 & Group)
+    // 3. Handle Real-Time Messaging (Enforcing socket.userId for authenticity)
     socket.on('send_message', async (data) => {
       try {
-        const { roomId, senderId, text, type, mediaUrl, replyToId } = data;
+        const { roomId, text, type, mediaUrl, replyToId } = data;
+        const senderId = socket.userId || data.senderId;
         if (!roomId || !senderId || (!text && !mediaUrl)) return;
 
         // Persist message to database
@@ -57,18 +78,17 @@ export function setupSocketHandlers(io) {
           replyToId: replyToId || null
         });
 
-        // Fetch all members of this room to guarantee real-time delivery
         const memberIds = await db.getRoomMemberIds(roomId);
 
         // Broadcast to target room channel
         io.to(roomId).emit('new_message', message);
 
-        // Also emit directly to every member's user channel to update unread counts and sidebar
+        // Also emit directly to every member's user channel
         for (const memberId of memberIds) {
           io.to(`user:${memberId}`).emit('new_message', message);
         }
 
-        // 🌟 KEY DIFFERENTIATOR: Group-to-Group Room Bridging!
+        // Room Bridging Logic
         const bridges = await db.getRoomBridges(roomId);
         if (bridges && bridges.length > 0) {
           for (const bridge of bridges) {
@@ -104,8 +124,9 @@ export function setupSocketHandlers(io) {
     });
 
     // 5. Message Reactions
-    socket.on('toggle_reaction', async ({ messageId, roomId, emoji, userId }) => {
+    socket.on('toggle_reaction', async ({ messageId, roomId, emoji }) => {
       try {
+        const userId = socket.userId || data?.userId;
         const updatedMsg = await db.toggleReaction(messageId, emoji, userId);
         if (updatedMsg) {
           io.to(roomId).emit('reaction_updated', { messageId, reactions: updatedMsg.reactions });
@@ -116,8 +137,9 @@ export function setupSocketHandlers(io) {
     });
 
     // 6. Theme Updates Notification
-    socket.on('update_theme', async ({ userId, themePreferences }) => {
-      const updated = await db.updateUserTheme(userId, themePreferences);
+    socket.on('update_theme', async ({ themePreferences }) => {
+      if (!socket.userId) return;
+      const updated = await db.updateUserTheme(socket.userId, themePreferences);
       socket.emit('theme_updated', updated);
     });
 
@@ -139,7 +161,7 @@ export function setupSocketHandlers(io) {
   });
 }
 
-// Function to notify participants when a new room (private or group) is created
+// Function to notify participants when a new room is created
 export function notifyRoomCreated(io, room, memberIds) {
   for (const memberId of memberIds) {
     io.to(`user:${memberId}`).emit('room_created', room);
