@@ -29,7 +29,6 @@ function getSupabaseHeaders() {
 async function findUserByEmail(email) {
   const clean = email.trim().toLowerCase();
   
-  // 1. Try Supabase Cloud Database first
   try {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -45,7 +44,6 @@ async function findUserByEmail(email) {
     console.warn('Supabase fetch user error:', e.message);
   }
 
-  // 2. Fallback to Memory Map
   for (const user of memoryUsers.values()) {
     if (user.email.toLowerCase() === clean) return user;
   }
@@ -87,10 +85,8 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
     created_at: new Date().toISOString()
   };
 
-  // Save to Memory
   memoryUsers.set(id, user);
 
-  // Save to Supabase Cloud DB
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/users`, {
       method: 'POST',
@@ -168,10 +164,10 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       })
     });
     const resData = await response.json();
+    console.log('Resend Response:', resData);
     if (response.ok && resData.id) {
       return { success: true, messageId: resData.id };
     } else {
-      console.warn('Resend response notice:', resData);
       return { success: false, error: resData };
     }
   } catch (err) {
@@ -253,7 +249,7 @@ app.post('/api/auth/register', async (req, res) => {
       </div>
     `;
 
-    await sendEmail({
+    const sendRes = await sendEmail({
       to: cleanEmail,
       subject: `Confirm your PulseRoom email address`,
       plainText: `Confirm your email: ${confirmLink}`,
@@ -261,8 +257,9 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     return res.status(201).json({
-      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox!`,
-      email: cleanEmail
+      message: `Confirmation email dispatched to ${cleanEmail}. Check your email inbox to confirm before logging in!`,
+      email: cleanEmail,
+      sendResult: sendRes
     });
   } catch (err) {
     console.error('Vercel Register Error:', err);
