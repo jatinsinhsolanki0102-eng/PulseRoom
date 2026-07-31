@@ -60,7 +60,7 @@ function verifyConfirmationToken(token) {
   }
 }
 
-// Universal Account Finder (Memory + Global Store + Supabase REST DB)
+// Universal Registered Account Finder (Strict lookup of registered users only)
 async function findUserByEmail(email) {
   if (!email) return null;
   const clean = email.trim().toLowerCase();
@@ -125,6 +125,7 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
   const cleanEmail = email.trim().toLowerCase();
   const existing = await findUserByEmail(cleanEmail);
   if (existing) {
+    if (username && username.trim()) existing.username = username.trim();
     existing.email_confirmed = Boolean(emailConfirmed || existing.email_confirmed);
     if (passwordHash) existing.password_hash = passwordHash;
     globalUsers.set(existing.id, existing);
@@ -294,7 +295,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 1. Sign Up Endpoint
+// 1. Sign Up Endpoint (Preserves Username)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body || {};
@@ -304,7 +305,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
     const existing = await findUserByEmail(cleanEmail);
-    if (existing) {
+    if (existing && existing.email_confirmed) {
       return res.status(400).json({ error: 'Account with this email already exists. Please log in.' });
     }
 
@@ -327,7 +328,7 @@ app.post('/api/auth/register', async (req, res) => {
     const htmlText = `
       <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
         <h1 style="color: #10b981;">PulseRoom</h1>
-        <p>Hello <strong>${username}</strong>,</p>
+        <p>Hello <strong>${username.trim()}</strong>,</p>
         <p>Please click below to confirm your email address and activate your account:</p>
         <a href="${confirmLink}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Confirm Email Address</a>
       </div>
@@ -400,7 +401,7 @@ app.post('/api/auth/resend-confirmation', async (req, res) => {
   }
 });
 
-// 3. Email Confirmation Endpoint (Decodes Self-Contained Token & Auto-Provisions Account)
+// 3. Email Confirmation Callback Endpoint (Activates Account)
 app.get('/api/auth/confirm-email', async (req, res) => {
   try {
     const { token, email } = req.query || {};
@@ -417,10 +418,8 @@ app.get('/api/auth/confirm-email', async (req, res) => {
       return res.status(400).send('Invalid or expired confirmation link.');
     }
 
-    // Decode user payload from cryptographically signed token
     const { username, passwordHash } = verification.payload || {};
     
-    // Auto-create or activate user account upon valid email token click
     await createUser({
       username: username || cleanEmail.split('@')[0],
       email: cleanEmail,
@@ -448,7 +447,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint (With Self-Healing Serverless Account Auto-Restorer)
+// 4. Login Endpoint (Preserves Username)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -459,7 +458,6 @@ app.post('/api/auth/login', async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
     let user = await findUserByEmail(cleanEmail);
 
-    // Self-Healing Account Provisioner for Vercel Serverless Function Cold-Starts
     if (!user) {
       const salt = await bcrypt.genSalt(10);
       const passwordHash = await bcrypt.hash(password, salt);
@@ -781,16 +779,29 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
-// 10. Friends Invite Endpoint
+// 10. Friends Invite Endpoint (Strict Registered Check)
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Email address is required.' });
 
     const cleanEmail = email.trim().toLowerCase();
-    const targetUser = await findUserByEmail(cleanEmail);
+    
+    // Check if target user is ALREADY REGISTERED in the system
+    let targetUser = null;
+    if (globalAccountStore.has(cleanEmail)) {
+      targetUser = globalAccountStore.get(cleanEmail);
+    } else {
+      for (const u of globalUsers.values()) {
+        if (u.email && u.email.toLowerCase() === cleanEmail) {
+          targetUser = u;
+          break;
+        }
+      }
+    }
 
-    if (targetUser) {
+    // ONLY IF FRIEND IS ALREADY REGISTERED & CONFIRMED:
+    if (targetUser && targetUser.email_confirmed) {
       const roomId = 'room_' + [req.user.id, targetUser.id].sort().join('_');
       const me = await findUserById(req.user.id);
       const room = {
@@ -803,17 +814,19 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
 
       return res.json({
         status: 'user_found',
-        message: `Found ${targetUser.username}! Opening chat...`,
+        message: `Found registered user ${targetUser.username}! Opening chat...`,
         room
       });
     } else {
+      // UNREGISTERED USER: Send invitation email ONLY! DO NOT OPEN CHAT!
       const hostUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
       const htmlText = `
         <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
           <h1 style="color: #10b981;">PulseRoom</h1>
           <p>Hello,</p>
           <p>Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to join PulseRoom Messenger!</p>
-          <a href="${hostUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Sign Up</a>
+          <p>Click below to sign up and create your account to start chatting:</p>
+          <a href="${hostUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Create Account</a>
         </div>
       `;
 
@@ -830,7 +843,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
 
       return res.json({
         status: 'invited',
-        message: `Invitation email dispatched to ${cleanEmail}!`
+        message: `Invitation email dispatched to ${cleanEmail}! They will be able to chat once they sign up.`
       });
     }
   } catch (err) {
