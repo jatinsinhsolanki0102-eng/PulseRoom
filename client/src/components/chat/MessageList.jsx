@@ -1,0 +1,55 @@
+import React, { useEffect, useRef } from 'react';
+import MessageBubble from './MessageBubble';
+
+export default function MessageList({ messages, roomId, typingUser, onReply, onDeleteMessage }) {
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, typingUser]);
+
+  return (
+    <div className="message-feed">
+      {messages.length === 0 ? (
+        <div style={{
+          margin: 'auto',
+          textAlign: 'center',
+          color: 'var(--text-dim)',
+          background: 'rgba(15, 23, 42, 0.6)',
+          padding: '1.5rem 2.5rem',
+          borderRadius: '20px',
+          border: '1px solid var(--panel-border)'
+        }}>
+          <h4 style={{ color: 'var(--text-main)', marginBottom: '0.25rem' }}>No messages in this room yet</h4>
+          <p style={{ fontSize: '0.85rem' }}>Send a message or voice note to initiate real-time chat!</p>
+        </div>
+      ) : (
+        messages.map(msg => (
+          <MessageBubble
+            key={msg.id}
+            message={msg}
+            roomId={roomId}
+            onReply={onReply}
+            onDeleteMessage={onDeleteMessage}
+          />
+        ))
+      )}
+
+      {/* Live Typing Indicator */}
+      {typingUser && (
+        <div className="message-row received" style={{ opacity: 0.8 }}>
+          <div className="bubble" style={{ fontSize: '0.8rem', fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span>{typingUser} is typing</span>
+            <span style={{ display: 'inline-flex', gap: '2px' }}>
+              <span style={{ animation: 'wave 1s infinite' }}>.</span>
+              <span style={{ animation: 'wave 1s infinite 0.2s' }}>.</span>
+              <span style={{ animation: 'wave 1s infinite 0.4s' }}>.</span>
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div ref={bottomRef} />
+    </div>
+  );
+}
