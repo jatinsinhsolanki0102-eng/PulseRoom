@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "npm run build --prefix client"
+    "build": "cd client && npm install && npm run build"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
