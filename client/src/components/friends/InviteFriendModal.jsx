@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { UserPlus, Mail, X, CheckCircle, Send } from 'lucide-react';
+import { UserPlus, Mail, X, CheckCircle } from 'lucide-react';
 
 export default function InviteFriendModal({ onClose, onChatInitiated }) {
   const { token } = useAuth();
@@ -32,10 +32,8 @@ export default function InviteFriendModal({ onClose, onChatInitiated }) {
       setResultMsg(data);
 
       if (data.status === 'user_found' && data.room) {
-        setTimeout(() => {
-          if (onChatInitiated) onChatInitiated(data.room);
-          onClose();
-        }, 1500);
+        if (onChatInitiated) onChatInitiated(data.room);
+        onClose();
       }
     } catch (err) {
       setErrorMsg(err.message);
@@ -105,7 +103,7 @@ export default function InviteFriendModal({ onClose, onChatInitiated }) {
             </div>
 
             <div style={{ fontSize: '0.8rem', color: 'var(--text-dim)', background: 'rgba(255,255,255,0.03)', padding: '0.75rem 1rem', borderRadius: '10px' }}>
-              💡 If your friend is already on PulseRoom, a chat will open instantly! If they aren't registered, an invitation email will be sent automatically.
+              💡 If your friend is already on PulseRoom, their private chat room opens instantly! If they aren't registered, an invitation email will be sent automatically.
             </div>
 
             <button
@@ -120,7 +118,7 @@ export default function InviteFriendModal({ onClose, onChatInitiated }) {
                 background: 'linear-gradient(135deg, #10b981, #06b6d4)'
               }}
             >
-              {loading ? 'Searching & Sending...' : 'Add / Send Email Invitation'}
+              {loading ? 'Searching & Connecting...' : 'Add Friend & Open Chat'}
             </button>
           </form>
         )}
