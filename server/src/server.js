@@ -18,26 +18,10 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
 
-// Test mailer fallback
-let etherealTransporter = null;
-
-async function initMailer() {
-  try {
-    const testAccount = await nodemailer.createTestAccount();
-    etherealTransporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
-      port: 587,
-      secure: false,
-      auth: { user: testAccount.user, pass: testAccount.pass }
-    });
-  } catch (e) {
-    console.warn('Test mailer setup warning:', e.message);
-  }
-}
-initMailer();
-
-// Multi-Provider Email Dispatcher
+// Universal Email Dispatcher Engine (Gmail SMTP Priority #1 for 100% Universal Delivery to ANY Email)
 async function sendEmail({ to, subject, htmlText, plainText }) {
+  dotenv.config({ override: true });
+
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
   const gmailUser = (process.env.GMAIL_USER || '').trim();
   const rawPass = (process.env.GMAIL_APP_PASS || '').trim();
@@ -45,9 +29,33 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
 
   console.log(`\n📧 Dispatching Email to ${to}...`);
 
-  // Priority 1: Resend API (If Key Provided)
+  // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Worldwide)
+  if (gmailUser && gmailPass) {
+    console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
+    try {
+      const gmailTransporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: gmailUser, pass: gmailPass }
+      });
+
+      const info = await gmailTransporter.sendMail({
+        from: `"PulseRoom Messenger" <${gmailUser}>`,
+        to,
+        subject,
+        text: plainText,
+        html: htmlText
+      });
+
+      console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to}! MessageID: ${info.messageId}`);
+      return { success: true, provider: 'gmail', messageId: info.messageId };
+    } catch (gErr) {
+      console.error(`❌ GMAIL SMTP ERROR: ${gErr.message}`);
+    }
+  }
+
+  // Priority 2: Resend API
   if (resendKey) {
-    console.log(`🚀 Dispatching via Resend API...`);
+    console.log(`🔄 Dispatching via Resend API...`);
     try {
       const response = await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -75,61 +83,22 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 2: Direct Gmail SMTP Engine (Universal Delivery)
-  if (gmailUser && gmailPass) {
-    console.log(`🔄 Dispatching via Gmail SMTP (${gmailUser})...`);
-    try {
-      const gmailTransporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: gmailUser, pass: gmailPass }
-      });
-
-      const info = await gmailTransporter.sendMail({
-        from: `"PulseRoom Messenger" <${gmailUser}>`,
-        to,
-        subject,
-        text: plainText,
-        html: htmlText
-      });
-
-      console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to}! MessageID: ${info.messageId}`);
-      return { success: true, provider: 'gmail', messageId: info.messageId };
-    } catch (gErr) {
-      console.error(`❌ GMAIL SMTP ERROR: ${gErr.message}`);
-    }
-  }
-
-  // Priority 3: Fallback Ethereal Test Mailer
-  if (etherealTransporter) {
-    try {
-      const info = await etherealTransporter.sendMail({
-        from: `"PulseRoom Messenger" <noreply@pulseroom.app>`,
-        to,
-        subject,
-        text: plainText,
-        html: htmlText
-      });
-      const testUrl = nodemailer.getTestMessageUrl(info);
-      console.log(`📧 Ethereal Test Mail Preview URL: ${testUrl}`);
-      return { success: true, provider: 'ethereal', previewUrl: testUrl };
-    } catch (e) {
-      console.error('Nodemailer Fallback Error:', e.message);
-    }
-  }
-
-  return { success: false, error: 'No active email dispatchers succeeded. Configure RESEND_API_KEY or GMAIL_USER/GMAIL_APP_PASS.' };
+  return {
+    success: false,
+    error: 'Email delivery failed. Please check GMAIL_USER / GMAIL_APP_PASS in server/.env.'
+  };
 }
 
 // Setup CORS
 app.use(cors({
-  origin: '*',
+  origin: process.env.CLIENT_URL || process.env.APP_URL || '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
-// Uploads directory setup (Relative to process.cwd())
+// Uploads directory setup
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -158,10 +127,6 @@ const io = new Server(server, {
 // Setup Socket handlers
 setupSocketHandlers(io);
 
-// ----------------------------------------------------
-// REST API ROUTES
-// ----------------------------------------------------
-
 // Health Check Endpoint
 app.get('/api/health', (req, res) => {
   res.json({
@@ -169,6 +134,7 @@ app.get('/api/health', (req, res) => {
     app: 'PulseRoom Real-Time Engine',
     pgConnected: db.isPgConnected(),
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
+    gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
     timestamp: new Date().toISOString()
   });
 });
@@ -229,14 +195,13 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (!result.success) {
       return res.status(500).json({
-        error: result.error || 'Account created, but we could not send the confirmation email right now. Please verify mail credentials.'
+        error: result.error || 'Account created, but we could not send the confirmation email right now. Please check mail credentials.'
       });
     }
 
     res.status(201).json({
-      message: `Confirmation email dispatched to ${cleanEmail}. Please check your email inbox and click the link to confirm before logging in.`,
-      email: cleanEmail,
-      previewUrl: result.previewUrl
+      message: `Confirmation email dispatched to ${cleanEmail}. Please check your inbox (including Spam folder) to confirm before logging in.`,
+      email: cleanEmail
     });
   } catch (err) {
     console.error('Sign Up Error:', err);
@@ -534,7 +499,7 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
   }
 });
 
-// 16. Messages: Delete Message (With Sender Ownership Check)
+// 16. Messages: Delete Message
 app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   try {
     const deleted = await db.deleteMessage(req.params.messageId, req.user.id);
@@ -549,7 +514,7 @@ app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   }
 });
 
-// 17. Uploads: Attachment, Video, Image, Audio Voice Note, or Profile Photo Upload
+// 17. Uploads Endpoint
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
