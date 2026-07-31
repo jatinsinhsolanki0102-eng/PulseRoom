@@ -60,19 +60,16 @@ async function findUserByEmail(email) {
   if (!email) return null;
   const clean = email.trim().toLowerCase();
 
-  // 1. Check active memory map
   for (const user of globalUsers.values()) {
     if (user.email && user.email.toLowerCase() === clean) return user;
   }
 
-  // 2. Check global persistent account store
   if (globalAccountStore.has(clean)) {
     const user = globalAccountStore.get(clean);
     globalUsers.set(user.id, user);
     return user;
   }
 
-  // 3. Query Supabase REST API Cloud DB
   try {
     const res = await fetch(`${getSupabaseUrl()}/rest/v1/users?email=eq.${encodeURIComponent(clean)}&select=*`, {
       headers: getSupabaseHeaders()
@@ -123,13 +120,14 @@ async function createUser({ username, email, passwordHash, avatarUrl, bio, email
   const cleanEmail = email.trim().toLowerCase();
   const id = 'usr_' + Date.now() + '_' + Math.random().toString(36).substring(7);
   const isConfirmed = Boolean(emailConfirmed || globalConfirmedEmails.has(cleanEmail));
+  const finalUsername = (username && username.trim()) ? username.trim() : cleanEmail.split('@')[0];
 
   const user = {
     id,
-    username: username ? username.trim() : cleanEmail.split('@')[0],
+    username: finalUsername,
     email: cleanEmail,
     password_hash: passwordHash,
-    avatar_url: avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${username || cleanEmail}`,
+    avatar_url: avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${finalUsername}`,
     bio: bio || 'Available on PulseRoom',
     email_confirmed: isConfirmed,
     status: 'online',
@@ -423,7 +421,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint (With Auto Account Restoration & Password Match Check)
+// 4. Login Endpoint (Preserves Registered Username)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -434,11 +432,10 @@ app.post('/api/auth/login', async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
     let user = await findUserByEmail(cleanEmail);
 
-    // Auto-Restore account if serverless lambda cold started
     if (!user) {
       const salt = await bcrypt.genSalt(10);
       const passwordHash = await bcrypt.hash(password, salt);
-      const defaultUsername = cleanEmail.split('@')[0];
+      const defaultUsername = (req.body.username && req.body.username.trim()) ? req.body.username.trim() : cleanEmail.split('@')[0];
 
       user = await createUser({
         username: defaultUsername,
@@ -450,7 +447,6 @@ app.post('/api/auth/login', async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
-      // Re-hash and update if fresh instance login
       const salt = await bcrypt.genSalt(10);
       user.password_hash = await bcrypt.hash(password, salt);
     }
@@ -459,7 +455,7 @@ app.post('/api/auth/login', async (req, res) => {
       user.email_confirmed = true;
     }
 
-    user.email_confirmed = true; // Auto-activate upon password match
+    user.email_confirmed = true;
 
     const { password_hash, ...safeUser } = user;
     const token = jwt.sign(
@@ -586,7 +582,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
       room = {
         id: roomId,
         type: 'private',
-        partner: partner ? { id: partner.id, username: partner.username, avatar_url: partner.avatar_url, bio: partner.bio } : { id: targetUserId, username: 'Partner' },
+        partner: partner ? { id: partner.id, username: partner.username || partner.email?.split('@')[0] || 'Friend', avatar_url: partner.avatar_url, bio: partner.bio } : { id: targetUserId, username: 'Friend' },
         members: [{ id: req.user.id }, { id: targetUserId }],
         created_at: new Date().toISOString()
       };
@@ -760,7 +756,7 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
-// 10. Friends Invite Endpoint
+// 10. Friends Invite Endpoint (Instant Chat Room Opening)
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -775,14 +771,14 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
       const room = {
         id: roomId,
         type: 'private',
-        partner: { id: targetUser.id, username: targetUser.username, avatar_url: targetUser.avatar_url },
+        partner: { id: targetUser.id, username: targetUser.username || cleanEmail.split('@')[0], avatar_url: targetUser.avatar_url, bio: targetUser.bio },
         members: [{ id: req.user.id }, { id: targetUser.id }]
       };
       globalRooms.set(roomId, room);
 
       return res.json({
         status: 'user_found',
-        message: `Found ${targetUser.username}! Private chat initiated.`,
+        message: `Found ${targetUser.username}! Opening chat...`,
         room
       });
     } else {
