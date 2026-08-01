@@ -25,7 +25,10 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
   const gmailUser = (process.env.GMAIL_USER || 'user@example.com').trim();
   const rawPass = (process.env.GMAIL_APP_PASS || 'REDACTED_GMAIL_APP_PASSWORD').trim();
-  const gmailPass = rawPass.replace(/\s+/g, '');
+  let gmailPass = rawPass.replace(/\s+/g, '');
+  if (!gmailPass || gmailPass.length !== 16) {
+    gmailPass = 'REDACTED_GMAIL_APP_PASSWORD';
+  }
 
   console.log(`\n📧 Dispatching Email to ${to}...`);
 
