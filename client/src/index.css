@@ -747,8 +747,33 @@ html, body, #root {
 }
 
 @media (max-width: 768px) {
+  html, body, #root {
+    height: 100%;
+    overflow: hidden;
+    touch-action: manipulation;
+  }
+
   .app-container {
+    height: 100dvh !important;
+    min-height: 100dvh !important;
+    max-height: 100dvh !important;
     flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar {
+    width: 100% !important;
+    min-width: 100% !important;
+    max-width: 100% !important;
+    height: 100dvh !important;
+    border-right: none !important;
+  }
+
+  .chat-view {
+    width: 100% !important;
+    min-width: 100% !important;
+    max-width: 100% !important;
+    height: 100dvh !important;
   }
 
   .mobile-back-btn {
@@ -757,8 +782,6 @@ html, body, #root {
 
   /* When no active chat selected: show sidebar 100% width, hide chat-view */
   .app-container.no-active-room .sidebar {
-    width: 100% !important;
-    min-width: 100% !important;
     display: flex !important;
   }
 
@@ -772,30 +795,46 @@ html, body, #root {
   }
 
   .app-container.has-active-room .chat-view {
-    width: 100% !important;
     display: flex !important;
   }
 
   .chat-header {
-    padding: 0 1rem !important;
+    padding: 0.6rem 0.85rem !important;
   }
 
   .composer-wrapper {
-    padding: 0.75rem 0.85rem !important;
+    padding: 0.5rem 0.6rem !important;
   }
 
   .message-feed {
-    padding: 1rem 0.85rem !important;
+    padding: 0.75rem 0.6rem !important;
   }
 
   .message-row {
-    max-width: 88% !important;
+    max-width: 92% !important;
   }
 
-  /* Full screen drawers & modals on mobile */
+  /* Status tray touch scroll optimization */
+  .status-tray {
+    padding: 0.6rem 0.5rem !important;
+    gap: 0.4rem !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Modal bottom sheet layout on mobile phones */
+  .modal-overlay {
+    padding: 0 !important;
+    align-items: flex-end !important;
+  }
+
   .modal-content {
-    width: 95% !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    max-height: 88dvh !important;
+    overflow-y: auto !important;
     padding: 1.25rem !important;
-    border-radius: 18px !important;
+    border-radius: 24px 24px 0 0 !important;
+    border-bottom: none !important;
   }
 }
