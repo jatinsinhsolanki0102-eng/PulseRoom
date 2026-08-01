@@ -34,7 +34,9 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
     try {
       const gmailTransporter = nodemailer.createTransport({
-        service: 'gmail',
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
         auth: { user: gmailUser, pass: gmailPass }
       });
 

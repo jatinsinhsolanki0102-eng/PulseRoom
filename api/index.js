@@ -217,11 +217,15 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   const gmailPass = rawPass.replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
+  let lastError = 'Email dispatch failed. Please verify mail configuration.';
+
   // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Address)
   if (gmailUser && gmailPass) {
     try {
       const transporter = nodemailer.createTransport({
-        service: 'gmail',
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
         auth: { user: gmailUser, pass: gmailPass }
       });
 
@@ -233,11 +237,12 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
         html: htmlText
       });
 
-      if (info.messageId) {
+      if (info && info.messageId) {
         return { success: true, provider: 'gmail', messageId: info.messageId };
       }
     } catch (gErr) {
       console.error('Gmail Direct SMTP Error:', gErr.message);
+      lastError = `Gmail Error: ${gErr.message}`;
     }
   }
 
@@ -262,12 +267,13 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       if (response.ok && resData.id) {
         return { success: true, provider: 'resend', messageId: resData.id };
       }
+      if (resData.message) lastError = `Resend Error: ${resData.message}`;
     } catch (err) {
       console.warn('Resend exception:', err.message);
     }
   }
 
-  return { success: false, error: 'Email dispatch failed. Please verify mail configuration.' };
+  return { success: false, error: lastError };
 }
 
 // Express App
