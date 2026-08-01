@@ -574,6 +574,13 @@ app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+  const mediaUrl = `/uploads/${req.file.filename}`;
+  const mediaType = req.file.mimetype.startsWith('video/') ? 'video' : req.file.mimetype.startsWith('audio/') ? 'audio' : 'image';
+  res.json({ mediaUrl, mediaType });
+});
+
 // 10. Statuses (Stories) Routes
 app.get('/api/statuses', authenticateToken, async (req, res) => {
   try {

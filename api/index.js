@@ -17,14 +17,6 @@ const globalMessages = global._pulseroom_messages || new Map();
 const globalStatuses = global._pulseroom_statuses || new Map();
 const globalPendingInvites = global._pulseroom_pending_invites || new Map();
 
-globalUsers.clear();
-globalConfirmedEmails.clear();
-globalAccountStore.clear();
-globalRooms.clear();
-globalMessages.clear();
-globalStatuses.clear();
-globalPendingInvites.clear();
-
 global._pulseroom_users = globalUsers;
 global._pulseroom_confirmed = globalConfirmedEmails;
 global._pulseroom_account_store = globalAccountStore;

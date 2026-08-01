@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { X, Send, Image as ImageIcon, Video as VideoIcon, Paperclip } from 'lucide-react';
+import { X, Send, Image as ImageIcon, Video as VideoIcon, Paperclip, Sparkles } from 'lucide-react';
 
 const STATUS_COLORS = ['#128c7e', '#6366f1', '#ec4899', '#f59e0b', '#8b5cf6', '#090d16'];
 
@@ -8,59 +8,60 @@ export default function CreateStatusModal({ onClose }) {
   const { token } = useAuth();
   const [text, setText] = useState('');
   const [bgColor, setBgColor] = useState('#128c7e');
-  const [mediaUrl, setMediaUrl] = useState('');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState('');
   const [mediaType, setMediaType] = useState('image'); // 'image' | 'video'
   const [loading, setLoading] = useState(false);
 
   const fileInputRef = useRef(null);
 
-  const handleFileUpload = async (e) => {
+  const handleFileChange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
 
-    const formData = new FormData();
-    formData.append('file', file);
+    setSelectedFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+    setMediaType(file.type.startsWith('video') ? 'video' : 'image');
+  };
 
-    try {
-      setLoading(true);
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setMediaUrl(data.mediaUrl);
-        setMediaType(data.mediaType || (file.type.startsWith('video') ? 'video' : 'image'));
-      }
-    } catch (err) {
-      console.error('File upload failed:', err);
-    } finally {
-      setLoading(false);
-    }
+  const handleRemoveMedia = () => {
+    setSelectedFile(null);
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!text.trim() && !mediaUrl) return;
+    if (!text.trim() && !selectedFile) return;
     setLoading(true);
 
     try {
+      const formData = new FormData();
+      if (text) formData.append('text', text);
+      if (bgColor) formData.append('bgColor', bgColor);
+      if (selectedFile) {
+        formData.append('media', selectedFile);
+        formData.append('mediaType', mediaType);
+      }
+
       const res = await fetch('/api/statuses', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ text, mediaUrl, mediaType, bgColor })
+        body: formData
       });
 
       if (res.ok) {
         onClose();
+      } else {
+        const data = await res.json();
+        alert(data.error || 'Failed to upload status.');
       }
     } catch (err) {
       console.error('Failed to create status:', err);
+      alert('Failed to upload status. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -78,8 +79,8 @@ export default function CreateStatusModal({ onClose }) {
         }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <h3 style={{ fontFamily: 'Outfit', color: 'white', fontWeight: '700' }}>Add Photo/Video Status</h3>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer' }}>
+          <h3 style={{ fontFamily: 'Outfit', color: 'white', fontWeight: '700', margin: 0 }}>Add Photo/Video Status</h3>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', padding: '0.25rem' }}>
             <X size={20} />
           </button>
         </div>
@@ -88,25 +89,25 @@ export default function CreateStatusModal({ onClose }) {
           <input
             type="file"
             ref={fileInputRef}
-            onChange={handleFileUpload}
+            onChange={handleFileChange}
             accept="image/*,video/*"
             style={{ display: 'none' }}
           />
 
           {/* Media Preview */}
-          {mediaUrl ? (
-            <div style={{ position: 'relative', borderRadius: '16px', overflow: 'hidden', maxHeight: '200px' }}>
+          {previewUrl ? (
+            <div style={{ position: 'relative', borderRadius: '16px', overflow: 'hidden', maxHeight: '220px', background: 'rgba(0,0,0,0.3)' }}>
               {mediaType === 'video' ? (
-                <video src={mediaUrl} controls style={{ width: '100%', maxHeight: '200px', objectFit: 'cover' }} />
+                <video src={previewUrl} controls style={{ width: '100%', maxHeight: '220px', objectFit: 'contain' }} />
               ) : (
-                <img src={mediaUrl} alt="Status Preview" style={{ width: '100%', maxHeight: '200px', objectFit: 'cover' }} />
+                <img src={previewUrl} alt="Status Preview" style={{ width: '100%', maxHeight: '220px', objectFit: 'cover' }} />
               )}
               <button
                 type="button"
-                onClick={() => setMediaUrl('')}
-                style={{ position: 'absolute', top: '8px', right: '8px', background: '#ef4444', border: 'none', borderRadius: '50%', color: 'white', width: '24px', height: '24px', cursor: 'pointer' }}
+                onClick={handleRemoveMedia}
+                style={{ position: 'absolute', top: '8px', right: '8px', background: '#ef4444', border: 'none', borderRadius: '50%', color: 'white', width: '28px', height: '28px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
               >
-                <X size={14} />
+                <X size={16} />
               </button>
             </div>
           ) : (
@@ -123,39 +124,43 @@ export default function CreateStatusModal({ onClose }) {
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
-                gap: '0.5rem'
+                gap: '0.5rem',
+                transition: 'all 0.2s ease'
               }}
             >
-              <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', gap: '0.75rem' }}>
                 <ImageIcon size={24} />
                 <VideoIcon size={24} />
               </div>
-              <span style={{ fontSize: '0.9rem', fontWeight: '600' }}>Click to upload Photo or Video Story</span>
+              <span style={{ fontWeight: '600', fontSize: '0.9rem' }}>Click to select Photo or Video</span>
+              <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>Supports JPG, PNG, MP4, WEBM</span>
             </button>
           )}
 
+          {/* Text Caption Input */}
           <textarea
-            rows={3}
-            placeholder="Add a caption or text update..."
+            placeholder="Write a status caption..."
             value={text}
             onChange={(e) => setText(e.target.value)}
+            rows={3}
             style={{
               width: '100%',
-              background: 'rgba(0,0,0,0.2)',
+              background: 'rgba(255,255,255,0.15)',
               border: '1px solid rgba(255,255,255,0.2)',
-              borderRadius: '16px',
-              padding: '0.85rem',
+              borderRadius: '12px',
+              padding: '0.75rem',
               color: 'white',
               fontSize: '1rem',
+              resize: 'none',
               outline: 'none',
-              resize: 'none'
+              fontFamily: 'inherit'
             }}
           />
 
-          {/* Color Picker */}
+          {/* Color Palette Selector */}
           <div>
-            <label style={{ display: 'block', fontSize: '0.8rem', color: 'rgba(255,255,255,0.8)', marginBottom: '0.4rem', fontWeight: '600' }}>
-              Choose Status Color:
+            <label style={{ color: 'rgba(255,255,255,0.9)', fontSize: '0.8rem', fontWeight: '600', display: 'block', marginBottom: '0.5rem' }}>
+              Background Color
             </label>
             <div style={{ display: 'flex', gap: '0.5rem' }}>
               {STATUS_COLORS.map(c => (
@@ -164,12 +169,14 @@ export default function CreateStatusModal({ onClose }) {
                   type="button"
                   onClick={() => setBgColor(c)}
                   style={{
-                    width: '30px',
-                    height: '30px',
+                    width: '32px',
+                    height: '32px',
                     borderRadius: '50%',
                     background: c,
-                    border: bgColor === c ? '3px solid white' : 'none',
-                    cursor: 'pointer'
+                    border: bgColor === c ? '3px solid white' : '1px solid rgba(255,255,255,0.3)',
+                    cursor: 'pointer',
+                    transform: bgColor === c ? 'scale(1.1)' : 'scale(1)',
+                    transition: 'all 0.2s ease'
                   }}
                 />
               ))}
@@ -179,13 +186,15 @@ export default function CreateStatusModal({ onClose }) {
           <button
             type="submit"
             disabled={loading}
+            className="send-btn-gradient-circle"
             style={{
-              padding: '0.75rem',
+              width: '100%',
               borderRadius: '12px',
-              background: 'white',
-              color: 'black',
-              border: 'none',
+              height: '46px',
               fontWeight: '700',
+              background: 'linear-gradient(135deg, #10b981, #06b6d4)',
+              color: 'white',
+              border: 'none',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
@@ -193,7 +202,13 @@ export default function CreateStatusModal({ onClose }) {
               gap: '0.5rem'
             }}
           >
-            <Send size={16} /> {loading ? 'Posting...' : 'Post Status'}
+            {loading ? (
+              'Uploading Status...'
+            ) : (
+              <>
+                <Send size={16} /> Share Status
+              </>
+            )}
           </button>
         </form>
       </div>
