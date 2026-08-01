@@ -23,9 +23,34 @@ const memoryDb = {
   messages: new Map(),
   statuses: new Map(),
   pinned_chats: new Set(),
+  pendingInvites: new Map(),
 };
 
+export async function clearAllDatabaseData() {
+  memoryDb.users.clear();
+  memoryDb.rooms.clear();
+  memoryDb.room_members = [];
+  memoryDb.room_bridges.clear();
+  memoryDb.messages.clear();
+  memoryDb.statuses.clear();
+  memoryDb.pinned_chats.clear();
+  if (memoryDb.pendingInvites) memoryDb.pendingInvites.clear();
+
+  if (isPgConnected) {
+    try {
+      const client = await pool.connect();
+      await client.query('TRUNCATE users, rooms, room_members, room_bridges, messages, statuses CASCADE;');
+      client.release();
+      console.log('🧹 PostgreSQL Database Truncated Cleanly.');
+    } catch (err) {
+      console.warn('PostgreSQL Truncate Notice:', err.message);
+    }
+  }
+  console.log('🧹 All users and rooms cleared from database.');
+}
+
 export async function initDb() {
+  await clearAllDatabaseData();
   try {
     const client = await pool.connect();
     console.log('⚡ Connected to PostgreSQL database successfully.');
@@ -116,6 +141,18 @@ export async function initDb() {
     // Create performance indexes
     await client.query(`CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);`);
+
+    // 7. Pending Friend Invites Table (auto-connect once invitee confirms email)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pending_invites (
+        id VARCHAR(36) PRIMARY KEY,
+        invitee_email VARCHAR(100) NOT NULL,
+        inviter_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (invitee_email, inviter_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_pending_invites_email ON pending_invites(invitee_email);`);
 
     client.release();
     console.log('✅ PostgreSQL Schema & Indexes Verified.');
@@ -357,6 +394,18 @@ export const db = {
     }
   },
 
+  createGroupRoom: async ({ name, description, avatarUrl, themeColor, createdBy, memberIds }) => {
+    return await db.createRoom({
+      type: 'group',
+      name,
+      description,
+      avatarUrl,
+      themeColor,
+      createdBy,
+      members: memberIds
+    });
+  },
+
   getRoomMemberIds: async (roomId) => {
     if (isPgConnected) {
       const res = await pool.query(`SELECT user_id FROM room_members WHERE room_id = $1`, [roomId]);
@@ -367,6 +416,7 @@ export const db = {
   },
 
   getOrCreatePrivateRoom: async (user1Id, user2Id) => {
+    let room = null;
     if (isPgConnected) {
       const res = await pool.query(
         `SELECT r.* FROM rooms r
@@ -375,27 +425,81 @@ export const db = {
          WHERE r.type = 'private' AND rm1.user_id = $1 AND rm2.user_id = $2`,
         [user1Id, user2Id]
       );
-      if (res.rows.length > 0) return res.rows[0];
-
-      return await db.createRoom({
-        type: 'private',
-        createdBy: user1Id,
-        members: [user2Id]
-      });
+      if (res.rows.length > 0) {
+        room = res.rows[0];
+      } else {
+        room = await db.createRoom({
+          type: 'private',
+          createdBy: user1Id,
+          members: [user2Id]
+        });
+      }
     } else {
-      for (const room of memoryDb.rooms.values()) {
-        if (room.type === 'private') {
-          const members = memoryDb.room_members.filter(m => m.room_id === room.id).map(m => m.user_id);
+      for (const r of memoryDb.rooms.values()) {
+        if (r.type === 'private') {
+          const members = memoryDb.room_members.filter(m => m.room_id === r.id).map(m => m.user_id);
           if (members.includes(user1Id) && members.includes(user2Id)) {
-            return room;
+            room = { ...r };
+            break;
           }
         }
       }
-      return await db.createRoom({
-        type: 'private',
-        createdBy: user1Id,
-        members: [user2Id]
-      });
+      if (!room) {
+        room = await db.createRoom({
+          type: 'private',
+          createdBy: user1Id,
+          members: [user2Id]
+        });
+      }
+    }
+
+    const partnerUser = await db.findUserById(user2Id);
+    if (partnerUser) {
+      const { password_hash, ...safePartner } = partnerUser;
+      room.partner = safePartner;
+    }
+    return room;
+  },
+
+  // Pending Friend Invites (auto-connect once the invitee confirms their email)
+  createPendingInvite: async ({ inviteeEmail, inviterId }) => {
+    const cleanEmail = inviteeEmail.trim().toLowerCase();
+    if (isPgConnected) {
+      const id = uuidv4();
+      await pool.query(
+        `INSERT INTO pending_invites (id, invitee_email, inviter_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (invitee_email, inviter_id) DO NOTHING`,
+        [id, cleanEmail, inviterId]
+      );
+    } else {
+      if (!memoryDb.pendingInvites.has(cleanEmail)) memoryDb.pendingInvites.set(cleanEmail, []);
+      const arr = memoryDb.pendingInvites.get(cleanEmail);
+      if (!arr.includes(inviterId)) arr.push(inviterId);
+    }
+  },
+
+  getPendingInvitesByEmail: async (email) => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT inviter_id FROM pending_invites WHERE LOWER(invitee_email) = LOWER($1)`, [cleanEmail]);
+      return res.rows.map(r => r.inviter_id);
+    } else {
+      return memoryDb.pendingInvites.get(cleanEmail) || [];
+    }
+  },
+
+  deletePendingInvite: async (email, inviterId) => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (isPgConnected) {
+      await pool.query(`DELETE FROM pending_invites WHERE LOWER(invitee_email) = LOWER($1) AND inviter_id = $2`, [cleanEmail, inviterId]);
+    } else {
+      const arr = memoryDb.pendingInvites.get(cleanEmail);
+      if (arr) {
+        const filtered = arr.filter(id => id !== inviterId);
+        if (filtered.length === 0) memoryDb.pendingInvites.delete(cleanEmail);
+        else memoryDb.pendingInvites.set(cleanEmail, filtered);
+      }
     }
   },
 
