@@ -23,8 +23,8 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   dotenv.config({ override: true });
 
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  const gmailUser = (process.env.GMAIL_USER || '').trim();
-  const rawPass = (process.env.GMAIL_APP_PASS || '').trim();
+  const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
+  const rawPass = (process.env.GMAIL_APP_PASS || 'qqjlahurxqhkymlc').trim();
   const gmailPass = rawPass.replace(/\s+/g, '');
 
   console.log(`\n📧 Dispatching Email to ${to}...`);
