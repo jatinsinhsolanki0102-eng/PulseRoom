@@ -8,6 +8,15 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'signup') {
+      localStorage.removeItem('pulseroom_token');
+      setToken(null);
+      setUser(null);
+      setLoading(false);
+      return;
+    }
+
     if (token) {
       fetchProfile();
     } else {

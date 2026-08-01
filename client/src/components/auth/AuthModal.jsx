@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MessageSquare, Sparkles, User, Mail, Lock, ArrowLeft, MailCheck, CheckCircle, RefreshCw } from 'lucide-react';
 
@@ -14,10 +14,24 @@ export default function AuthModal() {
   const [username, setUsername] = useState('');
   const [bio, setBio] = useState('');
   const [avatarSeed, setAvatarSeed] = useState('PulseUser1');
+  const [inviterName, setInviterName] = useState('');
   
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const isSignupMode = params.get('mode') === 'signup';
+    const invitedEmail = params.get('email');
+    const inviter = params.get('inviter');
+
+    if (isSignupMode) {
+      setMode('register');
+      if (invitedEmail) setEmail(invitedEmail);
+      if (inviter) setInviterName(inviter);
+    }
+  }, []);
 
   const avatarUrl = `https://api.dicebear.com/7.x/bottts/svg?seed=${avatarSeed}`;
 
@@ -219,6 +233,24 @@ export default function AuthModal() {
         {/* 2. REGISTER MODE */}
         {mode === 'register' && (
           <form onSubmit={handleRegisterSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            {inviterName && (
+              <div style={{
+                background: 'rgba(16, 185, 129, 0.15)',
+                border: '1px solid rgba(16, 185, 129, 0.3)',
+                borderRadius: '12px',
+                padding: '0.85rem 1rem',
+                color: '#34d399',
+                fontSize: '0.85rem',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem'
+              }}>
+                <Sparkles size={18} style={{ color: '#10b981', flexShrink: 0 }} />
+                <div>
+                  <strong>{inviterName}</strong> invited you to connect on <strong>PulseRoom</strong>! Create your account below to start chatting.
+                </div>
+              </div>
+            )}
             <div style={{ textAlign: 'center', marginBottom: '0.5rem' }}>
               <img
                 src={avatarUrl}

@@ -676,20 +676,30 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
     } else {
       // UNREGISTERED OR UNCONFIRMED: Dispatches email ONLY! NO CHAT ROOM OPENED!
       const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const inviteSignupUrl = `${clientUrl}/?mode=signup&email=${encodeURIComponent(cleanEmail)}&inviter=${encodeURIComponent(req.user.username)}`;
+
       const htmlText = `
-        <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
-          <h1 style="color: #10b981;">PulseRoom</h1>
-          <p>Hello,</p>
-          <p>Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to connect on <strong>PulseRoom Messenger</strong>.</p>
-          <p>Click below to sign up and create your account to start chatting with ${req.user.username}:</p>
-          <a href="${clientUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Sign Up</a>
+        <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.1);">
+          <div style="text-align: center; margin-bottom: 20px;">
+            <h1 style="color: #10b981; font-size: 26px; margin: 0;">PulseRoom</h1>
+            <p style="color: #94a3b8; font-size: 14px; margin-top: 4px;">Friend Invitation</p>
+          </div>
+          <div style="background: rgba(255,255,255,0.05); padding: 20px; border-radius: 12px; text-align: center; border: 1px solid rgba(16,185,129,0.3);">
+            <p style="color: #e2e8f0; font-size: 15px; margin-bottom: 16px;">Hello,</p>
+            <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to connect on <strong>PulseRoom Messenger</strong>.</p>
+            <p style="color: #e2e8f0; font-size: 14px; margin-bottom: 20px;">Click the button below to sign up and create your account to start chatting with ${req.user.username}:</p>
+            <div style="margin: 20px 0;">
+              <a href="${inviteSignupUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block;">Accept Invitation & Sign Up</a>
+            </div>
+            <p style="color: #64748b; font-size: 12px;">Or open link: <a href="${inviteSignupUrl}" style="color: #38bdf8;">${inviteSignupUrl}</a></p>
+          </div>
         </div>
       `;
 
       const result = await sendEmail({
         to: cleanEmail,
         subject: `Your friend ${req.user.username} invited you to join PulseRoom Messenger!`,
-        plainText: `Your friend ${req.user.username} invited you to join PulseRoom: ${clientUrl}`,
+        plainText: `Your friend ${req.user.username} invited you to join PulseRoom: ${inviteSignupUrl}`,
         htmlText
       });
 
