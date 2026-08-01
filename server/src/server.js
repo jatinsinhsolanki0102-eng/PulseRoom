@@ -139,6 +139,12 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Express Root Route: Redirect backend root GET / to Frontend Web App
+app.get('/', (req, res) => {
+  const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+  res.redirect(clientUrl);
+});
+
 // 1. Auth: Sign Up (Email Confirmation Required Before Login)
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -150,7 +156,7 @@ app.post('/api/auth/register', async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
 
     const existingUser = await db.findUserByEmail(cleanEmail);
-    if (existingUser) {
+    if (existingUser && existingUser.email_confirmed) {
       return res.status(400).json({ error: 'Account with this email already exists. Please log in.' });
     }
 
@@ -267,8 +273,24 @@ app.get('/api/auth/confirm-email', async (req, res) => {
       return res.status(400).send('Invalid or expired confirmation link.');
     }
 
-    await db.confirmUserEmail(cleanEmail);
-    const clientUrl = (process.env.CLIENT_URL || process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const confirmedUser = await db.confirmUserEmail(cleanEmail);
+
+    // Auto-connect pending friend invitations so the inviter's chat room opens automatically
+    if (confirmedUser) {
+      const pendingInviterIds = await db.getPendingInvitesByEmail(cleanEmail);
+      for (const inviterId of pendingInviterIds) {
+        if (inviterId === confirmedUser.id) continue;
+        try {
+          const room = await db.getOrCreatePrivateRoom(inviterId, confirmedUser.id);
+          notifyRoomCreated(io, room, [inviterId, confirmedUser.id]);
+          await db.deletePendingInvite(cleanEmail, inviterId);
+        } catch (roomErr) {
+          console.error('Auto-connect invited room error:', roomErr.message);
+        }
+      }
+    }
+
+    const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
 
     res.send(`
       <html>
@@ -348,62 +370,69 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     if (newPassword) {
       const newHash = await hashPassword(newPassword);
-      await db.resetUserPassword(cleanEmail, newHash);
+      await db.updateUserPassword(cleanEmail, newHash);
       return res.json({ message: 'Password updated successfully! You can now log in with your new password.' });
     }
 
-    res.json({ message: 'Account found. Enter your new password to reset.' });
+    res.json({ message: 'Account found.' });
   } catch (err) {
-    console.error('Forgot Password Error:', err);
     res.status(500).json({ error: 'Failed to process password reset.' });
   }
 });
 
-// 6. User: Get Current Profile
+// 6. User Profile & Settings Routes
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const user = await db.findUserById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found.' });
-    res.json(user);
+    const { password_hash, ...safeUser } = user;
+    res.json(safeUser);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user profile.' });
   }
 });
 
-// 7. User: Update Profile
-app.put('/api/users/profile', authenticateToken, async (req, res) => {
+app.put('/api/users/profile', authenticateToken, upload.single('avatar'), async (req, res) => {
   try {
-    const { username, avatarUrl, bio } = req.body;
+    const { username, bio } = req.body;
+    let avatarUrl = undefined;
+    if (req.file) {
+      avatarUrl = `/uploads/${req.file.filename}`;
+    } else if (req.body.avatarUrl) {
+      avatarUrl = req.body.avatarUrl;
+    }
+
     const updatedUser = await db.updateUserProfile(req.user.id, { username, avatarUrl, bio });
     if (!updatedUser) return res.status(404).json({ error: 'User not found.' });
+
+    io.emit('user_profile_updated', updatedUser);
     res.json(updatedUser);
   } catch (err) {
-    console.error('Update profile error:', err);
-    res.status(500).json({ error: 'Failed to update user profile.' });
+    console.error('Update Profile Error:', err);
+    res.status(500).json({ error: 'Failed to update profile.' });
   }
 });
 
-// 8. User: Search & List All Users
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
     const users = await db.getAllUsers(req.user.id);
     res.json(users);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch users list.' });
+    res.status(500).json({ error: 'Failed to fetch users.' });
   }
 });
 
-// 9. User: Update Theme Customization
 app.put('/api/users/theme', authenticateToken, async (req, res) => {
   try {
-    const updatedTheme = await db.updateUserTheme(req.user.id, req.body);
-    res.json({ theme_preferences: updatedTheme });
+    const themePrefs = req.body;
+    const updatedUser = await db.updateUserTheme(req.user.id, themePrefs);
+    res.json(updatedUser);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update theme preferences.' });
   }
 });
 
-// 10. Rooms: Get User Rooms
+// 7. Rooms & Groups Routes
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = await db.getUserRooms(req.user.id);
@@ -413,143 +442,171 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
   }
 });
 
-// 11. Rooms: Initiate 1:1 Private Chat
 app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   try {
     const { targetUserId } = req.body;
-    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required.' });
+    if (!targetUserId) return res.status(400).json({ error: 'targetUserId is required.' });
+    if (targetUserId === req.user.id) return res.status(400).json({ error: 'Cannot create direct chat with yourself.' });
 
     const room = await db.getOrCreatePrivateRoom(req.user.id, targetUserId);
     notifyRoomCreated(io, room, [req.user.id, targetUserId]);
     res.json(room);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to initiate private room.' });
+    console.error('Create Private Room Error:', err);
+    res.status(500).json({ error: 'Failed to create direct chat.' });
   }
 });
 
-// 12. Rooms: Create Group Room
-app.post('/api/rooms/group', authenticateToken, async (req, res) => {
+app.post('/api/rooms/group', authenticateToken, upload.single('avatar'), async (req, res) => {
   try {
-    const { name, description, avatarUrl, themeColor, members } = req.body;
+    const { name, description, themeColor } = req.body;
+    let members = req.body.members;
+    if (typeof members === 'string') {
+      try { members = JSON.parse(members); } catch (e) { members = []; }
+    }
     if (!name) return res.status(400).json({ error: 'Group name is required.' });
 
-    const room = await db.createRoom({
-      type: 'group',
+    let avatarUrl = '';
+    if (req.file) {
+      avatarUrl = `/uploads/${req.file.filename}`;
+    } else if (req.body.avatarUrl) {
+      avatarUrl = req.body.avatarUrl;
+    }
+
+    const room = await db.createGroupRoom({
       name,
       description,
-      avatarUrl: avatarUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${name}`,
-      themeColor: themeColor || '#128c7e',
+      avatarUrl,
+      themeColor,
       createdBy: req.user.id,
-      members: members || []
+      memberIds: members || []
     });
 
-    const allMembers = Array.from(new Set([req.user.id, ...(members || [])]));
-    notifyRoomCreated(io, room, allMembers);
+    const allMemberIds = Array.from(new Set([req.user.id, ...(members || [])]));
+    notifyRoomCreated(io, room, allMemberIds);
 
     res.status(201).json(room);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to create group room.' });
+    console.error('Create Group Error:', err);
+    res.status(500).json({ error: 'Failed to create group.' });
   }
 });
 
-// 13. Rooms: Create Room-to-Room Bridge
+// 8. Room Bridges Routes
 app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
   try {
     const { sourceRoomId, targetRoomId } = req.body;
     if (!sourceRoomId || !targetRoomId) {
-      return res.status(400).json({ error: 'sourceRoomId and targetRoomId required.' });
+      return res.status(400).json({ error: 'sourceRoomId and targetRoomId are required.' });
     }
 
-    const bridge = await db.createBridge(sourceRoomId, targetRoomId, req.user.id);
+    const bridge = await db.createRoomBridge(sourceRoomId, targetRoomId, req.user.id);
+    io.emit('room_bridged', bridge);
     res.status(201).json(bridge);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create room bridge.' });
   }
 });
 
-// 14. Messages: Get Messages for a Room
+app.get('/api/rooms/bridges', authenticateToken, async (req, res) => {
+  try {
+    const bridges = await db.getAllBridges();
+    res.json(bridges);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch bridges.' });
+  }
+});
+
+// 9. Messages REST Routes
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
     const messages = await db.getRoomMessages(req.params.roomId);
     res.json(messages);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch room messages.' });
+    res.status(500).json({ error: 'Failed to fetch messages.' });
   }
 });
 
-// 15. Messages: Post Message (REST Fallback)
-app.post('/api/messages', authenticateToken, async (req, res) => {
+app.post('/api/messages', authenticateToken, upload.single('media'), async (req, res) => {
   try {
-    const { roomId, text, type, mediaUrl, replyToId } = req.body;
+    const { roomId, text, type, replyToId } = req.body;
     if (!roomId) return res.status(400).json({ error: 'roomId is required.' });
 
-    const msg = await db.createMessage({
+    let mediaUrl = undefined;
+    if (req.file) {
+      mediaUrl = `/uploads/${req.file.filename}`;
+    } else if (req.body.mediaUrl) {
+      mediaUrl = req.body.mediaUrl;
+    }
+
+    const message = await db.createMessage({
       roomId,
       senderId: req.user.id,
       text,
-      type: type || 'text',
+      type: type || (mediaUrl ? (req.file?.mimetype.startsWith('video/') ? 'video' : 'image') : 'text'),
       mediaUrl,
       replyToId
     });
 
-    io.to(roomId).emit('new_message', msg);
-    res.status(201).json(msg);
+    io.to(roomId).emit('new_message', message);
+    res.status(201).json(message);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to post message.' });
+    console.error('Create Message Error:', err);
+    res.status(500).json({ error: 'Failed to send message.' });
   }
 });
 
-// 16. Messages: Delete Message
 app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   try {
-    const deleted = await db.deleteMessage(req.params.messageId, req.user.id);
-    if (deleted) {
-      io.to(deleted.room_id).emit('message_deleted', req.params.messageId);
-      res.json({ message: 'Message deleted.' });
-    } else {
-      res.status(403).json({ error: 'Unauthorized or message not found.' });
+    const message = await db.getMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+
+    if (message.sender_id !== req.user.id) {
+      return res.status(403).json({ error: 'You can only delete your own messages.' });
     }
+
+    await db.deleteMessage(req.params.messageId, req.user.id);
+    io.to(message.room_id).emit('message_deleted', req.params.messageId);
+    io.emit('message_deleted', req.params.messageId);
+    res.json({ message: 'Message deleted successfully.' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete message.' });
   }
 });
 
-// 17. Uploads Endpoint
-app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
+// 10. Statuses (Stories) Routes
+app.get('/api/statuses', authenticateToken, async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-    const mediaUrl = `/uploads/${req.file.filename}`;
-    const mediaType = req.file.mimetype.startsWith('video/') ? 'video' : req.file.mimetype.startsWith('audio/') ? 'audio' : 'image';
-    res.json({ mediaUrl, mediaType, filename: req.file.originalname, fileType: req.file.mimetype });
+    const statuses = await db.getStatuses();
+    res.json(statuses);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to upload media file.' });
+    res.status(500).json({ error: 'Failed to fetch statuses.' });
   }
 });
 
-// 18. Statuses / Stories
-app.post('/api/statuses', authenticateToken, async (req, res) => {
+app.post('/api/statuses', authenticateToken, upload.single('media'), async (req, res) => {
   try {
-    const { text, mediaUrl, mediaType, bgColor } = req.body;
+    const { text, bgColor, mediaType } = req.body;
+    let mediaUrl = undefined;
+    if (req.file) {
+      mediaUrl = `/uploads/${req.file.filename}`;
+    } else if (req.body.mediaUrl) {
+      mediaUrl = req.body.mediaUrl;
+    }
+
     const status = await db.createStatus({
       userId: req.user.id,
       text,
       mediaUrl,
-      mediaType: mediaType || 'image',
+      mediaType: mediaType || (req.file?.mimetype.startsWith('video/') ? 'video' : 'image'),
       bgColor
     });
+
     io.emit('new_status', status);
     res.status(201).json(status);
   } catch (err) {
+    console.error('Create Status Error:', err);
     res.status(500).json({ error: 'Failed to create status.' });
-  }
-});
-
-app.get('/api/statuses', authenticateToken, async (req, res) => {
-  try {
-    const statuses = await db.getAllActiveStatuses();
-    res.json(statuses);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch statuses.' });
   }
 });
 
@@ -567,7 +624,7 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
-// 19. Toggle Pin Chat
+// 11. Toggle Pin Chat
 app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   try {
     const isPinned = await db.togglePinChat(req.user.id, req.params.roomId);
@@ -577,7 +634,7 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   }
 });
 
-// 20. Add / Invite Friend by Email
+// 12. Add / Invite Friend by Email (STRICT REGISTERED & CONFIRMED CHECK)
 app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body;
@@ -586,27 +643,28 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
     const targetUser = await db.findUserByEmail(cleanEmail);
 
-    if (targetUser) {
+    // STRICT RULE: Only initiate direct chat IF user exists AND email_confirmed is TRUE!
+    if (targetUser && targetUser.email_confirmed) {
       if (targetUser.id === req.user.id) {
         return res.status(400).json({ error: 'You cannot invite yourself.' });
       }
       const room = await db.getOrCreatePrivateRoom(req.user.id, targetUser.id);
       notifyRoomCreated(io, room, [req.user.id, targetUser.id]);
       
-      const appUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+      const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
       const htmlText = `
         <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
           <h1 style="color: #10b981;">PulseRoom</h1>
           <p>Hello <strong>${targetUser.username}</strong>,</p>
           <p>Your friend <strong>${req.user.username}</strong> started a private chat with you on PulseRoom!</p>
-          <a href="${appUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Open PulseRoom Chat</a>
+          <a href="${clientUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Open PulseRoom Chat</a>
         </div>
       `;
 
       sendEmail({
         to: cleanEmail,
         subject: `${req.user.username} started a private chat with you on PulseRoom!`,
-        plainText: `Hello ${targetUser.username}, your friend ${req.user.username} started a private chat with you. Open PulseRoom at ${appUrl}`,
+        plainText: `Hello ${targetUser.username}, your friend ${req.user.username} started a private chat with you. Open PulseRoom at ${clientUrl}`,
         htmlText
       });
 
@@ -616,20 +674,22 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         room
       });
     } else {
-      const appUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+      // UNREGISTERED OR UNCONFIRMED: Dispatches email ONLY! NO CHAT ROOM OPENED!
+      const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
       const htmlText = `
         <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
           <h1 style="color: #10b981;">PulseRoom</h1>
           <p>Hello,</p>
           <p>Your friend <strong>${req.user.username}</strong> (${req.user.email}) invited you to connect on <strong>PulseRoom Messenger</strong>.</p>
-          <a href="${appUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Sign Up</a>
+          <p>Click below to sign up and create your account to start chatting with ${req.user.username}:</p>
+          <a href="${clientUrl}" style="background: #10b981; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 15px 0;">Accept Invitation & Sign Up</a>
         </div>
       `;
 
       const result = await sendEmail({
         to: cleanEmail,
         subject: `Your friend ${req.user.username} invited you to join PulseRoom Messenger!`,
-        plainText: `Your friend ${req.user.username} invited you to join PulseRoom: ${appUrl}`,
+        plainText: `Your friend ${req.user.username} invited you to join PulseRoom: ${clientUrl}`,
         htmlText
       });
 
@@ -637,9 +697,12 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to send invitation email.' });
       }
 
+      // Record the pending invitation so the private chat auto-connects once they sign up & confirm
+      await db.createPendingInvite({ inviteeEmail: cleanEmail, inviterId: req.user.id });
+
       return res.json({
         status: 'invited',
-        message: `Invitation email dispatched to ${cleanEmail}!`
+        message: `Invitation email dispatched to ${cleanEmail}! Your chat room will open automatically once they sign up and confirm their email.`
       });
     }
   } catch (err) {

@@ -15,6 +15,15 @@ const globalAccountStore = global._pulseroom_account_store || new Map();
 const globalRooms = global._pulseroom_rooms || new Map();
 const globalMessages = global._pulseroom_messages || new Map();
 const globalStatuses = global._pulseroom_statuses || new Map();
+const globalPendingInvites = global._pulseroom_pending_invites || new Map();
+
+globalUsers.clear();
+globalConfirmedEmails.clear();
+globalAccountStore.clear();
+globalRooms.clear();
+globalMessages.clear();
+globalStatuses.clear();
+globalPendingInvites.clear();
 
 global._pulseroom_users = globalUsers;
 global._pulseroom_confirmed = globalConfirmedEmails;
@@ -22,6 +31,7 @@ global._pulseroom_account_store = globalAccountStore;
 global._pulseroom_rooms = globalRooms;
 global._pulseroom_messages = globalMessages;
 global._pulseroom_statuses = globalStatuses;
+global._pulseroom_pending_invites = globalPendingInvites;
 
 function getSupabaseHeaders() {
   const key = getSupabaseAnonKey();
@@ -428,6 +438,23 @@ app.get('/api/auth/confirm-email', async (req, res) => {
     });
 
     await markEmailConfirmed(cleanEmail);
+
+    // Auto-connect pending friend invitations so the inviter's chat room opens automatically
+    const confirmedUser = await findUserByEmail(cleanEmail);
+    const pendingInviterIds = globalPendingInvites.get(cleanEmail) || [];
+    for (const inviterId of pendingInviterIds) {
+      if (confirmedUser && inviterId === confirmedUser.id) continue;
+      const roomId = 'room_' + [inviterId, confirmedUser?.id].sort().join('_');
+      const room = {
+        id: roomId,
+        type: 'private',
+        partner: confirmedUser ? { id: confirmedUser.id, username: confirmedUser.username || cleanEmail.split('@')[0], avatar_url: confirmedUser.avatar_url, bio: confirmedUser.bio } : null,
+        members: [{ id: inviterId }, { id: confirmedUser?.id }]
+      };
+      globalRooms.set(roomId, room);
+    }
+    globalPendingInvites.delete(cleanEmail);
+
     const clientUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
 
     res.send(`
@@ -841,9 +868,15 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: result.error || 'Failed to send invitation email.' });
       }
 
+      // Record the pending invitation so the private chat auto-connects once they sign up & confirm
+      if (!globalPendingInvites.has(cleanEmail)) globalPendingInvites.set(cleanEmail, []);
+      if (!globalPendingInvites.get(cleanEmail).includes(req.user.id)) {
+        globalPendingInvites.get(cleanEmail).push(req.user.id);
+      }
+
       return res.json({
         status: 'invited',
-        message: `Invitation email dispatched to ${cleanEmail}! They will be able to chat once they sign up.`
+        message: `Invitation email dispatched to ${cleanEmail}! Your chat room will open automatically once they sign up and confirm their email.`
       });
     }
   } catch (err) {
