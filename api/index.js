@@ -213,7 +213,7 @@ async function resetUserPassword(email, newPasswordHash) {
 // Universal Multi-Provider Email Dispatcher (Gmail SMTP Priority #1)
 async function sendEmail({ to, subject, htmlText, plainText }) {
   const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
-  const rawPass = (process.env.GMAIL_APP_PASS || 'ptxubglafsafnrxr').trim();
+  const rawPass = (process.env.GMAIL_APP_PASS || 'qqjlahurxqhkymlc').trim();
   const gmailPass = rawPass.replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
