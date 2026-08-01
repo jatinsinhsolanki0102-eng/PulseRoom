@@ -214,10 +214,13 @@ async function resetUserPassword(email, newPasswordHash) {
 async function sendEmail({ to, subject, htmlText, plainText }) {
   const gmailUser = (process.env.GMAIL_USER || 'jatinsinhsolanki0102@gmail.com').trim();
   const rawPass = (process.env.GMAIL_APP_PASS || 'qqjlahurxqhkymlc').trim();
-  const gmailPass = rawPass.replace(/\s+/g, '');
+  let gmailPass = rawPass.replace(/\s+/g, '');
+  if (!gmailPass || gmailPass.length !== 16) {
+    gmailPass = 'qqjlahurxqhkymlc';
+  }
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-  let lastError = 'Email dispatch failed. Please verify mail configuration.';
+  let lastError = '';
 
   // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Address)
   if (gmailUser && gmailPass) {
@@ -242,11 +245,11 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       }
     } catch (gErr) {
       console.error('Gmail Direct SMTP Error:', gErr.message);
-      lastError = `Gmail Error: ${gErr.message}`;
+      lastError = gErr.message;
     }
   }
 
-  // Priority 2: Resend API
+  // Priority 2: Resend API Fallback
   if (resendKey) {
     try {
       const response = await fetch('https://api.resend.com/emails', {
@@ -267,13 +270,13 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
       if (response.ok && resData.id) {
         return { success: true, provider: 'resend', messageId: resData.id };
       }
-      if (resData.message) lastError = `Resend Error: ${resData.message}`;
+      if (resData.message) lastError = resData.message;
     } catch (err) {
       console.warn('Resend exception:', err.message);
     }
   }
 
-  return { success: false, error: lastError };
+  return { success: false, error: lastError || 'Email dispatch failed. Please verify mail configuration.' };
 }
 
 // Express App
