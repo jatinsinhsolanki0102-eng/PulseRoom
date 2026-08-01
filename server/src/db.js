@@ -50,7 +50,6 @@ export async function clearAllDatabaseData() {
 }
 
 export async function initDb() {
-  await clearAllDatabaseData();
   try {
     const client = await pool.connect();
     console.log('⚡ Connected to PostgreSQL database successfully.');
