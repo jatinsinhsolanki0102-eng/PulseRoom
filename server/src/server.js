@@ -23,12 +23,8 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   dotenv.config({ override: true });
 
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
-  const gmailUser = (process.env.GMAIL_USER || 'user@example.com').trim();
-  let rawPass = (process.env.GMAIL_APP_PASS || 'REDACTED_GMAIL_APP_PASSWORD').trim();
-  let gmailPass = rawPass.replace(/\s+/g, '');
-  if (gmailPass.includes('REDACTED_GMAIL_APP_PASSWORD') || gmailPass.length !== 16) {
-    gmailPass = 'REDACTED_GMAIL_APP_PASSWORD';
-  }
+  const gmailUser = (process.env.GMAIL_USER || '').trim();
+  const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
 
   console.log(`\n📧 Dispatching Email to ${to}...`);
 
@@ -430,6 +426,22 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete a user account by email (admin/maintenance helper)
+app.delete('/api/users', authenticateToken, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Email address is required.' });
+
+    const removed = await db.deleteUserByEmail(email);
+    if (!removed) return res.status(404).json({ error: 'No user found with that email address.' });
+
+    res.json({ message: `User ${removed.username} (${removed.email}) deleted.` });
+  } catch (err) {
+    console.error('Delete User Error:', err);
+    res.status(500).json({ error: 'Failed to delete user.' });
+  }
+});
+
 app.put('/api/users/theme', authenticateToken, async (req, res) => {
   try {
     const themePrefs = req.body;
@@ -528,7 +540,7 @@ app.get('/api/rooms/bridges', authenticateToken, async (req, res) => {
 // 9. Messages REST Routes
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
-    const messages = await db.getRoomMessages(req.params.roomId);
+    const messages = await db.getRoomMessages(req.params.roomId, req.user.id);
     res.json(messages);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch messages.' });
@@ -564,20 +576,22 @@ app.post('/api/messages', authenticateToken, upload.single('media'), async (req,
   }
 });
 
+// WhatsApp-style "Delete for me": hides the message ONLY for the requesting user.
 app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   try {
     const message = await db.getMessageById(req.params.messageId);
     if (!message) return res.status(404).json({ error: 'Message not found.' });
 
-    if (message.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'You can only delete your own messages.' });
-    }
+    const result = await db.deleteMessageForMe(req.params.messageId, req.user.id);
+    if (!result) return res.status(404).json({ error: 'Message not found.' });
 
-    await db.deleteMessage(req.params.messageId, req.user.id);
-    io.to(message.room_id).emit('message_deleted', req.params.messageId);
-    io.emit('message_deleted', req.params.messageId);
-    res.json({ message: 'Message deleted successfully.' });
+    const payload = { messageId: req.params.messageId, userId: req.user.id };
+    io.to(message.room_id).emit('message_deleted_for_me', payload);
+    io.to(`user:${req.user.id}`).emit('message_deleted_for_me', payload);
+
+    res.json({ message: 'Message deleted for you.', payload });
   } catch (err) {
+    console.error('Delete Message Error:', err);
     res.status(500).json({ error: 'Failed to delete message.' });
   }
 });
@@ -646,6 +660,76 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
     res.json({ is_pinned: isPinned });
   } catch (err) {
     res.status(500).json({ error: 'Failed to pin chat.' });
+  }
+});
+
+// 11b. Add members to an existing group room
+app.post('/api/rooms/:roomId/members', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const { memberIds } = req.body;
+    if (!Array.isArray(memberIds) || memberIds.length === 0) {
+      return res.status(400).json({ error: 'memberIds must be a non-empty array.' });
+    }
+
+    const existingMemberIds = await db.getRoomMemberIds(roomId);
+    if (!existingMemberIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    const allMemberIds = await db.addRoomMembers(roomId, memberIds);
+
+    const rooms = await db.getUserRooms(req.user.id);
+    const updatedRoom = rooms.find(r => r.id === roomId);
+
+    notifyRoomCreated(io, updatedRoom || { id: roomId }, allMemberIds);
+    io.emit('room_members_updated', updatedRoom || { id: roomId });
+
+    res.json(updatedRoom || { id: roomId });
+  } catch (err) {
+    console.error('Add Room Members Error:', err);
+    res.status(500).json({ error: 'Failed to add members.' });
+  }
+});
+
+// 11c. WhatsApp-style "Clear chat": clears ALL messages for THIS user only (chat stays in list).
+app.post('/api/rooms/:roomId/clear', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const memberIds = await db.getRoomMemberIds(roomId);
+    if (!memberIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    await db.clearChatForUser(roomId, req.user.id);
+
+    io.to(`user:${req.user.id}`).emit('room_cleared', { roomId, userId: req.user.id });
+    res.json({ message: 'Chat cleared for you only.' });
+  } catch (err) {
+    console.error('Clear Room Error:', err);
+    res.status(500).json({ error: 'Failed to clear chat.' });
+  }
+});
+
+// 11c. WhatsApp-style "Delete chat": removes the chat from THIS user's list only.
+app.delete('/api/rooms/:roomId', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const memberIds = await db.getRoomMemberIds(roomId);
+    if (!memberIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    const result = await db.deleteChatForUser(roomId, req.user.id);
+    if (!result) return res.status(404).json({ error: 'Room not found.' });
+
+    const payload = { roomId, userId: req.user.id };
+    io.to(`user:${req.user.id}`).emit('room_deleted_for_me', payload);
+
+    res.json({ message: 'Chat deleted for you only.' });
+  } catch (err) {
+    console.error('Delete Room Error:', err);
+    res.status(500).json({ error: 'Failed to delete chat.' });
   }
 });
 
@@ -718,12 +802,15 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         htmlText
       });
 
-      if (!result.success) {
-        return res.status(500).json({ error: 'Failed to send invitation email.' });
-      }
-
       // Record the pending invitation so the private chat auto-connects once they sign up & confirm
       await db.createPendingInvite({ inviteeEmail: cleanEmail, inviterId: req.user.id });
+
+      if (!result.success) {
+        return res.json({
+          status: 'invited_pending',
+          message: `Invitation saved for ${cleanEmail}, but the email could not be sent right now (mail service unavailable). The chat will open automatically once they sign up.`
+        });
+      }
 
       return res.json({
         status: 'invited',

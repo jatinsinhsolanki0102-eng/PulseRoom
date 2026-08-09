@@ -32,10 +32,18 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
 
     socket.on('room_created', handleRealTimeRoomUpdate);
     socket.on('new_message', handleRealTimeRoomUpdate);
+    socket.on('room_deleted', handleRealTimeRoomUpdate);
+    socket.on('room_deleted_for_me', handleRealTimeRoomUpdate);
+    socket.on('room_cleared', handleRealTimeRoomUpdate);
+    socket.on('room_members_updated', handleRealTimeRoomUpdate);
 
     return () => {
       socket.off('room_created', handleRealTimeRoomUpdate);
       socket.off('new_message', handleRealTimeRoomUpdate);
+      socket.off('room_deleted', handleRealTimeRoomUpdate);
+      socket.off('room_deleted_for_me', handleRealTimeRoomUpdate);
+      socket.off('room_cleared', handleRealTimeRoomUpdate);
+      socket.off('room_members_updated', handleRealTimeRoomUpdate);
     };
   }, [socket]);
 

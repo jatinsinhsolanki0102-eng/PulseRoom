@@ -80,17 +80,19 @@ export default function InviteFriendModal({ onClose, onChatInitiated }) {
         )}
 
         {/* Result Message for Unregistered Friends */}
-        {resultData && resultData.status === 'invited' ? (
+        {resultData && (resultData.status === 'invited' || resultData.status === 'invited_pending') ? (
           <div style={{
             padding: '1.5rem',
             textAlign: 'center',
-            background: 'rgba(16, 185, 129, 0.12)',
-            border: '1px solid rgba(16, 185, 129, 0.3)',
+            background: resultData.status === 'invited' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+            border: `1px solid ${resultData.status === 'invited' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(245, 158, 11, 0.3)'}`,
             borderRadius: '16px',
-            color: '#34d399'
+            color: resultData.status === 'invited' ? '#34d399' : '#fbbf24'
           }}>
-            <CheckCircle size={36} style={{ margin: '0 auto 0.75rem', color: '#10b981' }} />
-            <div style={{ fontWeight: '700', fontSize: '1rem', marginBottom: '0.5rem' }}>Invitation Dispatched!</div>
+            <CheckCircle size={36} style={{ margin: '0 auto 0.75rem', color: resultData.status === 'invited' ? '#10b981' : '#f59e0b' }} />
+            <div style={{ fontWeight: '700', fontSize: '1rem', marginBottom: '0.5rem' }}>
+              {resultData.status === 'invited' ? 'Invitation Dispatched!' : 'Invitation Saved'}
+            </div>
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>
               {resultData.message}
             </p>

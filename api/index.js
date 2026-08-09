@@ -3,8 +3,30 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 
-const getJwtSecret = () => process.env.JWT_SECRET || 'REDACTED_JWT_SECRET';
+// Stable JWT secret that survives cold starts where possible (env JWT_SECRET is
+// required for tokens to survive across real Vercel cold starts; locally we also
+// persist a generated secret to disk so restarts do not invalidate sessions).
+const _secretFile = path.join(process.cwd(), 'data', '.jwt-secret');
+const _instanceJwtSecret = process.env.JWT_SECRET || (() => {
+  try {
+    if (!fs.existsSync(path.dirname(_secretFile))) fs.mkdirSync(path.dirname(_secretFile), { recursive: true });
+    if (fs.existsSync(_secretFile)) {
+      const stored = fs.readFileSync(_secretFile, 'utf8').trim();
+      if (stored) return stored;
+    }
+    const secret = 'pr_' + crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(_secretFile, secret);
+    return secret;
+  } catch (e) {
+    return 'pr_det_' + crypto.createHash('sha256').update('pulseroom-stable-session-key').digest('hex').slice(0, 32);
+  }
+})();
+const getJwtSecret = () => _instanceJwtSecret;
 const getSupabaseUrl = () => (process.env.SUPABASE_URL || 'https://jponpdmojuxxaecxgpgv.supabase.co').replace(/\/$/, '');
 const getSupabaseAnonKey = () => process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impwb25wZG1vanV4eGFlY3hncGd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NjM2NzAsImV4cCI6MjEwMTAzOTY3MH0.hZI2QRFxU7ZHQ4FnH2pLnqQBA6BSUX3bih3WQRh6za4';
 
@@ -212,12 +234,8 @@ async function resetUserPassword(email, newPasswordHash) {
 
 // Universal Multi-Provider Email Dispatcher (Gmail SMTP Priority #1)
 async function sendEmail({ to, subject, htmlText, plainText }) {
-  const gmailUser = (process.env.GMAIL_USER || 'user@example.com').trim();
-  let rawPass = (process.env.GMAIL_APP_PASS || 'REDACTED_GMAIL_APP_PASSWORD').trim();
-  let gmailPass = rawPass.replace(/\s+/g, '');
-  if (gmailPass.includes('REDACTED_GMAIL_APP_PASSWORD') || gmailPass.length !== 16) {
-    gmailPass = 'REDACTED_GMAIL_APP_PASSWORD';
-  }
+  const gmailUser = (process.env.GMAIL_USER || '').trim();
+  const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
   let lastError = '';
@@ -283,6 +301,12 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
+
+// In-memory upload buffer (serverless deployments cannot persist files to disk)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }
+});
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -460,6 +484,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
       const room = {
         id: roomId,
         type: 'private',
+        cleared_by: [],
         partner: confirmedUser ? { id: confirmedUser.id, username: confirmedUser.username || cleanEmail.split('@')[0], avatar_url: confirmedUser.avatar_url, bio: confirmedUser.bio } : null,
         members: [{ id: inviterId }, { id: confirmedUser?.id }]
       };
@@ -486,7 +511,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
   }
 });
 
-// 4. Login Endpoint (Preserves Username)
+// 4. Login Endpoint (Preserves Username - NEVER auto-creates accounts)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -495,25 +520,19 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    let user = await findUserByEmail(cleanEmail);
+    const user = await findUserByEmail(cleanEmail);
 
     if (!user) {
-      const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(password, salt);
-      const defaultUsername = (req.body.username && req.body.username.trim()) ? req.body.username.trim() : cleanEmail.split('@')[0];
-
-      user = await createUser({
-        username: defaultUsername,
-        email: cleanEmail,
-        passwordHash,
-        emailConfirmed: true
-      });
+      return res.status(401).json({ error: 'No account found with this email. Please sign up first.' });
     }
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
-      const salt = await bcrypt.genSalt(10);
-      user.password_hash = await bcrypt.hash(password, salt);
+      return res.status(401).json({ error: 'Incorrect password. Please try again or use "Forgot Password?".' });
+    }
+
+    if (!user.email_confirmed && !globalConfirmedEmails.has(cleanEmail)) {
+      return res.status(403).json({ error: 'Please confirm your email address first before logging in.' });
     }
 
     user.email_confirmed = true;
@@ -560,14 +579,7 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
     const user = await findUserById(req.user.id);
     if (!user) {
-      return res.json({
-        id: req.user.id,
-        username: req.user.username || req.user.email.split('@')[0],
-        email: req.user.email,
-        avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${req.user.username || 'User'}`,
-        bio: 'Available on PulseRoom',
-        email_confirmed: true
-      });
+      return res.status(401).json({ error: 'Account not found. Please sign up again.' });
     }
     const { password_hash, ...safe } = user;
     return res.json(safe);
@@ -621,7 +633,8 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
     const rooms = Array.from(globalRooms.values()).filter(r =>
-      r.members && r.members.some(m => m.id === req.user.id)
+      r.members && r.members.some(m => m.id === req.user.id) &&
+      !(r.cleared_by || []).includes(req.user.id)
     );
     return res.json(rooms);
   } catch (err) {
@@ -644,6 +657,7 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
       room = {
         id: roomId,
         type: 'private',
+        cleared_by: [],
         partner: partner ? { id: partner.id, username: partner.username || partner.email?.split('@')[0] || 'Friend', avatar_url: partner.avatar_url, bio: partner.bio } : { id: targetUserId, username: 'Friend' },
         members: [{ id: req.user.id }, { id: targetUserId }],
         created_at: new Date().toISOString()
@@ -673,6 +687,7 @@ app.post('/api/rooms/group', authenticateToken, async (req, res) => {
       avatar_url: avatarUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${name}`,
       theme_color: themeColor || '#128c7e',
       created_by: req.user.id,
+      cleared_by: [],
       members: allMemberIds.map(id => ({ id })),
       created_at: new Date().toISOString()
     };
@@ -707,10 +722,87 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/rooms/:roomId/members', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+    if (!room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    const { memberIds } = req.body || {};
+    const ids = Array.isArray(memberIds) ? memberIds : [];
+    const existing = new Set((room.members || []).map(m => m.id));
+
+    for (const id of ids) {
+      if (!existing.has(id)) {
+        room.members.push({ id });
+        existing.add(id);
+      }
+    }
+
+    return res.json(room);
+  } catch (err) {
+    console.error('Add room members error:', err);
+    return res.status(500).json({ error: 'Failed to add members.' });
+  }
+});
+
+// WhatsApp-style "Clear chat": clears ALL messages for THIS user only (chat stays in list).
+app.post('/api/rooms/:roomId/clear', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+    if (!room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    const msgs = globalMessages.get(req.params.roomId) || [];
+    for (const msg of msgs) {
+      if (!msg.deleted_for) msg.deleted_for = [];
+      if (!msg.deleted_for.includes(req.user.id)) msg.deleted_for.push(req.user.id);
+    }
+
+    return res.json({ message: 'Chat cleared for you only.' });
+  } catch (err) {
+    console.error('Clear room error:', err);
+    return res.status(500).json({ error: 'Failed to clear chat.' });
+  }
+});
+
+// WhatsApp-style "Delete chat": removes the chat from THIS user's list only.
+app.delete('/api/rooms/:roomId', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+    if (!room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    if (!room.cleared_by) room.cleared_by = [];
+    if (!room.cleared_by.includes(req.user.id)) room.cleared_by.push(req.user.id);
+
+    const msgs = globalMessages.get(req.params.roomId) || [];
+    for (const msg of msgs) {
+      if (!msg.deleted_for) msg.deleted_for = [];
+      if (!msg.deleted_for.includes(req.user.id)) msg.deleted_for.push(req.user.id);
+    }
+
+    return res.json({ message: 'Chat deleted for you only.' });
+  } catch (err) {
+    console.error('Delete room error:', err);
+    return res.status(500).json({ error: 'Failed to delete chat.' });
+  }
+});
+
 // 8. Messages REST Endpoints
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
-    const msgs = globalMessages.get(req.params.roomId) || [];
+    const msgs = (globalMessages.get(req.params.roomId) || [])
+      .filter(m => !(m.deleted_for || []).includes(req.user.id));
     return res.json(msgs);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch room messages.' });
@@ -731,10 +823,13 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
       sender_id: req.user.id,
       username: user ? user.username : req.user.username || 'User',
       avatar_url: user ? user.avatar_url : '',
+      sender_name: user ? user.username : req.user.username || 'User',
+      sender_avatar: user ? user.avatar_url : '',
       text,
       type: type || 'text',
       media_url: mediaUrl,
       reply_to_id: replyToId,
+      deleted_for: [],
       created_at: new Date().toISOString()
     };
 
@@ -749,21 +844,33 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
   }
 });
 
+// WhatsApp-style "Delete for me": hides the message ONLY for the requesting user.
 app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   try {
-    for (const [roomId, msgs] of globalMessages.entries()) {
-      const idx = msgs.findIndex(m => m.id === req.params.messageId);
-      if (idx !== -1) {
-        if (msgs[idx].sender_id !== req.user.id) {
-          return res.status(403).json({ error: 'You can only delete your own messages.' });
-        }
-        msgs.splice(idx, 1);
-        return res.json({ message: 'Message deleted.' });
+    for (const msgs of globalMessages.values()) {
+      const msg = msgs.find(m => m.id === req.params.messageId);
+      if (msg) {
+        if (!msg.deleted_for) msg.deleted_for = [];
+        if (!msg.deleted_for.includes(req.user.id)) msg.deleted_for.push(req.user.id);
+        return res.json({ message: 'Message deleted for you.', payload: { messageId: req.params.messageId, userId: req.user.id } });
       }
     }
     return res.status(404).json({ error: 'Message not found.' });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to delete message.' });
+  }
+});
+
+// 8b. Upload Endpoint (returns an in-memory data URL since serverless has no persistent disk)
+app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+    const mime = req.file.mimetype || 'application/octet-stream';
+    const dataUrl = `data:${mime};base64,${req.file.buffer.toString('base64')}`;
+    const mediaType = mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : 'image';
+    return res.json({ mediaUrl: dataUrl, mediaType });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to process upload.' });
   }
 });
 
@@ -846,6 +953,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
       const room = {
         id: roomId,
         type: 'private',
+        cleared_by: [],
         partner: { id: targetUser.id, username: targetUser.username || cleanEmail.split('@')[0], avatar_url: targetUser.avatar_url, bio: targetUser.bio },
         members: [{ id: req.user.id }, { id: targetUser.id }]
       };
@@ -876,14 +984,17 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
         htmlText
       });
 
-      if (!result.success) {
-        return res.status(500).json({ error: result.error || 'Failed to send invitation email.' });
-      }
-
       // Record the pending invitation so the private chat auto-connects once they sign up & confirm
       if (!globalPendingInvites.has(cleanEmail)) globalPendingInvites.set(cleanEmail, []);
       if (!globalPendingInvites.get(cleanEmail).includes(req.user.id)) {
         globalPendingInvites.get(cleanEmail).push(req.user.id);
+      }
+
+      if (!result.success) {
+        return res.json({
+          status: 'invited_pending',
+          message: `Invitation saved for ${cleanEmail}, but the email could not be sent right now (mail service unavailable). The chat will open automatically once they sign up.`
+        });
       }
 
       return res.json({

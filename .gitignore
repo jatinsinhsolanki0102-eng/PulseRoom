@@ -4,3 +4,10 @@ dist
 uploads
 *.log
 .DS_Store
+data
+
+# Local test/scratch scripts (may contain credentials)
+client/gen_token.mjs
+client/sock_test.mjs
+server/gen_token.mjs
+server/src/test_saffrony.js

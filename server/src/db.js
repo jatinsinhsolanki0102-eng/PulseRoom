@@ -1,5 +1,7 @@
 import pkg from 'pg';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
 dotenv.config();
@@ -25,6 +27,72 @@ const memoryDb = {
   pinned_chats: new Set(),
   pendingInvites: new Map(),
 };
+
+// ---------- Durable In-Memory Backup (data survives server restarts even without Postgres) ----------
+const DATA_DIR = path.join(process.cwd(), 'data');
+const MEMORY_DB_FILE = path.join(DATA_DIR, 'memory-db.json');
+
+function readSerializableMemoryDb() {
+  return {
+    users: Object.fromEntries(memoryDb.users),
+    rooms: Object.fromEntries(memoryDb.rooms),
+    room_members: memoryDb.room_members,
+    room_bridges: Object.fromEntries(memoryDb.room_bridges),
+    messages: Object.fromEntries(memoryDb.messages),
+    statuses: Object.fromEntries(memoryDb.statuses),
+    pinned_chats: Array.from(memoryDb.pinned_chats),
+    pendingInvites: Object.fromEntries(memoryDb.pendingInvites)
+  };
+}
+
+function writeSerializableMemoryDb(data) {
+  memoryDb.users = new Map(Object.entries(data.users || {}));
+  memoryDb.rooms = new Map(Object.entries(data.rooms || {}));
+  memoryDb.room_members = Array.isArray(data.room_members) ? data.room_members : [];
+  memoryDb.room_bridges = new Map(Object.entries(data.room_bridges || {}));
+  memoryDb.messages = new Map(Object.entries(data.messages || {}));
+  memoryDb.statuses = new Map(Object.entries(data.statuses || {}));
+  memoryDb.pinned_chats = new Set(Array.isArray(data.pinned_chats) ? data.pinned_chats : []);
+  memoryDb.pendingInvites = new Map(Object.entries(data.pendingInvites || {}));
+}
+
+function saveMemoryDbNow() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(MEMORY_DB_FILE, JSON.stringify(readSerializableMemoryDb()));
+  } catch (e) {
+    console.warn('Memory DB save warning:', e.message);
+  }
+}
+
+let memorySaveTimer = null;
+function scheduleMemoryDbSave() {
+  if (isPgConnected) return;
+  if (memorySaveTimer) clearTimeout(memorySaveTimer);
+  memorySaveTimer = setTimeout(() => {
+    memorySaveTimer = null;
+    saveMemoryDbNow();
+  }, 250);
+}
+
+export async function loadMemoryDatabase() {
+  try {
+    if (fs.existsSync(MEMORY_DB_FILE)) {
+      const raw = fs.readFileSync(MEMORY_DB_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      writeSerializableMemoryDb(data);
+      console.log('💾 In-memory database restored from disk backup.');
+    }
+  } catch (e) {
+    console.warn('Memory DB load warning:', e.message);
+  }
+}
+
+process.on('exit', saveMemoryDbNow);
+process.on('SIGINT', () => {
+  saveMemoryDbNow();
+  process.exit(0);
+});
 
 export async function clearAllDatabaseData() {
   memoryDb.users.clear();
@@ -120,9 +188,16 @@ export async function initDb() {
         reactions JSONB DEFAULT '{}',
         reply_to_id VARCHAR(36) REFERENCES messages(id) ON DELETE SET NULL,
         read_by JSONB DEFAULT '[]',
+        deleted_for JSONB DEFAULT '[]',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Per-user soft-delete support (WhatsApp-style "delete for me")
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for JSONB DEFAULT '[]';`);
+    await client.query(`UPDATE messages SET deleted_for = '[]' WHERE deleted_for IS NULL;`);
+    await client.query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS cleared_by JSONB DEFAULT '[]';`);
+    await client.query(`UPDATE rooms SET cleared_by = '[]' WHERE cleared_by IS NULL;`);
 
     // 6. Status / Stories Table
     await client.query(`
@@ -159,6 +234,7 @@ export async function initDb() {
     console.warn('⚠️ Could not connect to external PostgreSQL server:', err.message);
     console.log('🚀 Operating in High-Performance Resilient Dual Database Mode (In-Memory Postgres Emulation active).');
     isPgConnected = false;
+    await loadMemoryDatabase();
   }
 }
 
@@ -201,6 +277,7 @@ export const db = {
         created_at: new Date().toISOString()
       };
       memoryDb.users.set(id, user);
+      scheduleMemoryDbSave();
       return user;
     }
   },
@@ -223,6 +300,7 @@ export const db = {
         if (username) u.username = username;
         if (avatarUrl) u.avatar_url = avatarUrl;
         if (bio !== undefined) u.bio = bio;
+        scheduleMemoryDbSave();
         const { password_hash, ...safeUser } = u;
         return safeUser;
       }
@@ -238,6 +316,7 @@ export const db = {
       for (const u of memoryDb.users.values()) {
         if (u.email.toLowerCase() === email.toLowerCase()) {
           u.email_confirmed = true;
+          scheduleMemoryDbSave();
           return u;
         }
       }
@@ -297,6 +376,7 @@ export const db = {
       if (u) {
         u.status = status;
         u.last_seen = lastSeen;
+        scheduleMemoryDbSave();
       }
     }
   },
@@ -312,6 +392,7 @@ export const db = {
       const u = memoryDb.users.get(userId);
       if (u) {
         u.theme_preferences = { ...u.theme_preferences, ...themePreferences };
+        scheduleMemoryDbSave();
         return u.theme_preferences;
       }
       return null;
@@ -329,6 +410,7 @@ export const db = {
       for (const u of memoryDb.users.values()) {
         if (u.email.toLowerCase() === email.toLowerCase()) {
           u.password_hash = newPasswordHash;
+          scheduleMemoryDbSave();
           return { id: u.id, username: u.username, email: u.email };
         }
       }
@@ -376,6 +458,7 @@ export const db = {
         avatar_url: avatarUrl || '',
         theme_color: themeColor || '#128c7e',
         created_by: createdBy,
+        cleared_by: [],
         created_at: new Date().toISOString()
       };
       memoryDb.rooms.set(id, room);
@@ -389,6 +472,7 @@ export const db = {
           joined_at: new Date().toISOString()
         });
       }
+      scheduleMemoryDbSave();
       return room;
     }
   },
@@ -411,6 +495,69 @@ export const db = {
       return res.rows.map(r => r.user_id);
     } else {
       return memoryDb.room_members.filter(m => m.room_id === roomId).map(m => m.user_id);
+    }
+  },
+
+  addRoomMembers: async (roomId, memberIds) => {
+    const toAdd = Array.from(new Set(memberIds || []));
+    if (toAdd.length === 0) return db.getRoomMemberIds(roomId);
+
+    if (isPgConnected) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const memberId of toAdd) {
+          await client.query(
+            `INSERT INTO room_members (room_id, user_id, role) VALUES ($1, $2, 'member')
+             ON CONFLICT (room_id, user_id) DO NOTHING`,
+            [roomId, memberId]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+      return db.getRoomMemberIds(roomId);
+    } else {
+      const existing = new Set(memoryDb.room_members.filter(m => m.room_id === roomId).map(m => m.user_id));
+      for (const memberId of toAdd) {
+        if (!existing.has(memberId)) {
+          memoryDb.room_members.push({
+            room_id: roomId,
+            user_id: memberId,
+            role: 'member',
+            joined_at: new Date().toISOString()
+          });
+        }
+      }
+      scheduleMemoryDbSave();
+      return memoryDb.room_members.filter(m => m.room_id === roomId).map(m => m.user_id);
+    }
+  },
+
+  deleteRoom: async (roomId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`DELETE FROM rooms WHERE id = $1 RETURNING id, type, name`, [roomId]);
+      return res.rows[0] || null;
+    } else {
+      const room = memoryDb.rooms.get(roomId);
+      if (!room) return null;
+      memoryDb.rooms.delete(roomId);
+      memoryDb.room_members = memoryDb.room_members.filter(m => m.room_id !== roomId);
+      for (const [id, msg] of memoryDb.messages.entries()) {
+        if (msg.room_id === roomId) memoryDb.messages.delete(id);
+      }
+      for (const [id, bridge] of memoryDb.room_bridges.entries()) {
+        if (bridge.source_room_id === roomId || bridge.target_room_id === roomId) memoryDb.room_bridges.delete(id);
+      }
+      for (const key of memoryDb.pinned_chats) {
+        if (key.endsWith(`:${roomId}`)) memoryDb.pinned_chats.delete(key);
+      }
+      scheduleMemoryDbSave();
+      return room;
     }
   },
 
@@ -475,6 +622,7 @@ export const db = {
       if (!memoryDb.pendingInvites.has(cleanEmail)) memoryDb.pendingInvites.set(cleanEmail, []);
       const arr = memoryDb.pendingInvites.get(cleanEmail);
       if (!arr.includes(inviterId)) arr.push(inviterId);
+      scheduleMemoryDbSave();
     }
   },
 
@@ -498,6 +646,7 @@ export const db = {
         const filtered = arr.filter(id => id !== inviterId);
         if (filtered.length === 0) memoryDb.pendingInvites.delete(cleanEmail);
         else memoryDb.pendingInvites.set(cleanEmail, filtered);
+        scheduleMemoryDbSave();
       }
     }
   },
@@ -507,10 +656,12 @@ export const db = {
       const res = await pool.query(
         `SELECT r.*, rm.role,
                 (SELECT JSON_BUILD_OBJECT('id', m.id, 'text', m.text, 'sender_id', m.sender_id, 'created_at', m.created_at)
-                 FROM messages m WHERE m.room_id = r.id ORDER BY m.created_at DESC LIMIT 1) as last_message
+                 FROM messages m
+                 WHERE m.room_id = r.id AND NOT (COALESCE(m.deleted_for, '[]') ? $1)
+                 ORDER BY m.created_at DESC LIMIT 1) as last_message
          FROM rooms r
          JOIN room_members rm ON r.id = rm.room_id
-         WHERE rm.user_id = $1
+         WHERE rm.user_id = $1 AND NOT (COALESCE(r.cleared_by, '[]') ? $1)
          ORDER BY r.created_at DESC`,
         [userId]
       );
@@ -546,11 +697,12 @@ export const db = {
       for (const entry of userMemberEntries) {
         const room = memoryDb.rooms.get(entry.room_id);
         if (!room) continue;
+        if (Array.isArray(room.cleared_by) && room.cleared_by.includes(userId)) continue;
 
         const roomCopy = { ...room, role: entry.role, is_pinned: memoryDb.pinned_chats.has(`${userId}:${room.id}`) };
 
         const roomMsgs = Array.from(memoryDb.messages.values())
-          .filter(m => m.room_id === room.id)
+          .filter(m => m.room_id === room.id && (!Array.isArray(m.deleted_for) || !m.deleted_for.includes(userId)))
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
         roomCopy.last_message = roomMsgs[0] || null;
@@ -607,6 +759,8 @@ export const db = {
       } catch (e) {
         console.warn('Persist pinned chat error:', e.message);
       }
+    } else {
+      scheduleMemoryDbSave();
     }
     return isPinned;
   },
@@ -631,6 +785,7 @@ export const db = {
         created_at: new Date().toISOString()
       };
       memoryDb.room_bridges.set(id, bridge);
+      scheduleMemoryDbSave();
       return bridge;
     }
   },
@@ -696,14 +851,25 @@ export const db = {
         reactions: {},
         reply_to_id: replyToId,
         read_by: [senderId],
+        deleted_for: [],
         created_at: createdAt
       };
       memoryDb.messages.set(id, message);
+      scheduleMemoryDbSave();
       return message;
     }
   },
 
-  getRoomMessages: async (roomId) => {
+  getMessageById: async (messageId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT * FROM messages WHERE id = $1`, [messageId]);
+      return res.rows[0] || null;
+    } else {
+      return memoryDb.messages.get(messageId) || null;
+    }
+  },
+
+  getRoomMessages: async (roomId, userId = null) => {
     if (isPgConnected) {
       const res = await pool.query(
         `SELECT m.*, u.username as sender_name, u.avatar_url as sender_avatar,
@@ -713,14 +879,14 @@ export const db = {
                  WHERE rm.id = m.reply_to_id) as reply_to
          FROM messages m
          LEFT JOIN users u ON m.sender_id = u.id
-         WHERE m.room_id = $1
+         WHERE m.room_id = $1 AND NOT (COALESCE(m.deleted_for, '[]') ? $2)
          ORDER BY m.created_at ASC`,
-        [roomId]
+        [roomId, userId || '__none__']
       );
       return res.rows;
     } else {
       const roomMsgs = Array.from(memoryDb.messages.values())
-        .filter(m => m.room_id === roomId)
+        .filter(m => m.room_id === roomId && (!userId || !Array.isArray(m.deleted_for) || !m.deleted_for.includes(userId)))
         .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
       return roomMsgs.map(m => {
@@ -750,9 +916,132 @@ export const db = {
       if (msg && msg.sender_id === userId) {
         const roomId = msg.room_id;
         memoryDb.messages.delete(messageId);
+        scheduleMemoryDbSave();
         return { room_id: roomId };
       }
       return null;
+    }
+  },
+
+  // WhatsApp-style "Delete for me": hides the message ONLY for the requesting user.
+  deleteMessageForMe: async (messageId, userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `UPDATE messages
+         SET deleted_for = COALESCE(deleted_for, '[]') || $2::jsonb
+         WHERE id = $1 AND NOT (COALESCE(deleted_for, '[]') ? $3)
+         RETURNING id, room_id`,
+        [messageId, JSON.stringify([userId]), userId]
+      );
+      return res.rows[0] || null;
+    } else {
+      const msg = memoryDb.messages.get(messageId);
+      if (!msg) return null;
+      if (!Array.isArray(msg.deleted_for)) msg.deleted_for = [];
+      if (!msg.deleted_for.includes(userId)) {
+        msg.deleted_for.push(userId);
+        scheduleMemoryDbSave();
+      }
+      return { id: msg.id, room_id: msg.room_id };
+    }
+  },
+
+  // WhatsApp-style "Clear chat": hides ALL messages in the room for the user, keeps the chat visible.
+  clearChatForUser: async (roomId, userId) => {
+    if (isPgConnected) {
+      await pool.query(
+        `UPDATE messages
+         SET deleted_for = COALESCE(deleted_for, '[]') || $2::jsonb
+         WHERE room_id = $1 AND NOT (COALESCE(deleted_for, '[]') ? $3)`,
+        [roomId, JSON.stringify([userId]), userId]
+      );
+      return true;
+    } else {
+      let changed = false;
+      for (const msg of memoryDb.messages.values()) {
+        if (msg.room_id === roomId && (!Array.isArray(msg.deleted_for) || !msg.deleted_for.includes(userId))) {
+          if (!Array.isArray(msg.deleted_for)) msg.deleted_for = [];
+          msg.deleted_for.push(userId);
+          changed = true;
+        }
+      }
+      if (changed) scheduleMemoryDbSave();
+      return true;
+    }
+  },
+
+  // WhatsApp-style "Delete chat": hides ALL messages AND removes the chat from the user's list only.
+  deleteChatForUser: async (roomId, userId) => {
+    if (isPgConnected) {
+      await pool.query(
+        `UPDATE messages
+         SET deleted_for = COALESCE(deleted_for, '[]') || $2::jsonb
+         WHERE room_id = $1 AND NOT (COALESCE(deleted_for, '[]') ? $3)`,
+        [roomId, JSON.stringify([userId]), userId]
+      );
+      const res = await pool.query(
+        `UPDATE rooms
+         SET cleared_by = COALESCE(cleared_by, '[]') || $2::jsonb
+         WHERE id = $1 AND NOT (COALESCE(cleared_by, '[]') ? $3)
+         RETURNING id`,
+        [roomId, JSON.stringify([userId]), userId]
+      );
+      return res.rows[0] || null;
+    } else {
+      const room = memoryDb.rooms.get(roomId);
+      if (!room) return null;
+      if (!Array.isArray(room.cleared_by)) room.cleared_by = [];
+      if (!room.cleared_by.includes(userId)) room.cleared_by.push(userId);
+      for (const msg of memoryDb.messages.values()) {
+        if (msg.room_id === roomId && (!Array.isArray(msg.deleted_for) || !msg.deleted_for.includes(userId))) {
+          if (!Array.isArray(msg.deleted_for)) msg.deleted_for = [];
+          msg.deleted_for.push(userId);
+        }
+      }
+      scheduleMemoryDbSave();
+      return { id: roomId };
+    }
+  },
+
+  deleteUserByEmail: async (email) => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (isPgConnected) {
+      const res = await pool.query(
+        `DELETE FROM users WHERE LOWER(email) = LOWER($1)
+         RETURNING id, username, email`,
+        [cleanEmail]
+      );
+      return res.rows[0] || null;
+    } else {
+      const removed = [];
+      for (const u of memoryDb.users.values()) {
+        if (u.email.toLowerCase() === cleanEmail) {
+          removed.push({ id: u.id, username: u.username, email: u.email });
+        }
+      }
+      for (const rec of removed) {
+        memoryDb.users.delete(rec.id);
+        memoryDb.room_members = memoryDb.room_members.filter(m => m.user_id !== rec.id);
+        for (const [roomId, room] of memoryDb.rooms.entries()) {
+          const remaining = memoryDb.room_members.filter(m => m.room_id === roomId);
+          if (remaining.length === 0) memoryDb.rooms.delete(roomId);
+        }
+        for (const [id, msg] of memoryDb.messages.entries()) {
+          if (msg.sender_id === rec.id) memoryDb.messages.delete(id);
+        }
+        for (const [id, st] of memoryDb.statuses.entries()) {
+          if (st.user_id === rec.id) memoryDb.statuses.delete(id);
+        }
+        if (memoryDb.pendingInvites) {
+          for (const [inviteeEmail, ids] of memoryDb.pendingInvites.entries()) {
+            const filtered = ids.filter(id => id !== rec.id);
+            if (filtered.length === 0) memoryDb.pendingInvites.delete(inviteeEmail);
+            else memoryDb.pendingInvites.set(inviteeEmail, filtered);
+          }
+        }
+        scheduleMemoryDbSave();
+      }
+      return removed[0] || null;
     }
   },
 
@@ -787,6 +1076,7 @@ export const db = {
       } else {
         msg.reactions[emoji].push(userId);
       }
+      scheduleMemoryDbSave();
       return msg;
     }
   },
@@ -826,6 +1116,7 @@ export const db = {
         created_at: createdAt
       };
       memoryDb.statuses.set(id, statusObj);
+      scheduleMemoryDbSave();
       return statusObj;
     }
   },
@@ -866,6 +1157,7 @@ export const db = {
       const st = memoryDb.statuses.get(statusId);
       if (st && st.user_id === userId) {
         memoryDb.statuses.delete(statusId);
+        scheduleMemoryDbSave();
         return { id: statusId };
       }
       return null;

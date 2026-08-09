@@ -1,15 +1,36 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { X, Pin, Users, Image as ImageIcon, Shield, Heart } from 'lucide-react';
+import { X, Pin, Users, Trash2, Eraser, UserPlus, Image as ImageIcon, Shield, Heart } from 'lucide-react';
+import AddMembersModal from '../groups/AddMembersModal';
 
-export default function ChatInfoDrawer({ room, onClose, onTogglePin }) {
+export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteChat, onClearChat, onMembersAdded }) {
   const { user } = useAuth();
+  const [showAddMembers, setShowAddMembers] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   if (!room) return null;
 
   const isPrivate = room.type === 'private';
   const name = isPrivate ? room.partner?.username || 'Private Chat' : room.name || 'Group Room';
   const avatar = isPrivate ? room.partner?.avatar_url : room.avatar_url;
   const bio = isPrivate ? room.partner?.bio : room.description;
+
+  const handleDelete = () => {
+    if (confirmDelete) {
+      onDeleteChat();
+    } else {
+      setConfirmDelete(true);
+    }
+  };
+
+  const handleClear = () => {
+    if (confirmClear) {
+      onClearChat();
+      setConfirmClear(false);
+    } else {
+      setConfirmClear(true);
+    }
+  };
 
   return (
     <div style={{
@@ -62,7 +83,65 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin }) {
             <Pin size={14} style={{ display: 'inline', marginRight: '4px' }} />
             {room.is_pinned ? 'Unpin Chat' : 'Pin Chat'}
           </button>
+
+          {!isPrivate && (
+            <button
+              onClick={() => setShowAddMembers(true)}
+              className="chip-btn"
+              style={{
+                padding: '0.5rem 1rem',
+                borderRadius: '99px',
+                background: 'rgba(255,255,255,0.06)',
+                color: 'var(--text-main)',
+                fontWeight: '600'
+              }}
+            >
+              <UserPlus size={14} style={{ display: 'inline', marginRight: '4px' }} />
+              Add Members
+            </button>
+          )}
+
+          <button
+            onClick={handleClear}
+            className="chip-btn"
+            style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '99px',
+              background: confirmClear ? '#f59e0b' : 'rgba(255,255,255,0.06)',
+              color: confirmClear ? 'white' : '#fbbf24',
+              fontWeight: '600'
+            }}
+          >
+            <Eraser size={14} style={{ display: 'inline', marginRight: '4px' }} />
+            {confirmClear ? 'Confirm Clear?' : 'Clear Chat'}
+          </button>
+
+          <button
+            onClick={handleDelete}
+            className="chip-btn"
+            style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '99px',
+              background: confirmDelete ? '#ef4444' : 'rgba(255,255,255,0.06)',
+              color: confirmDelete ? 'white' : '#f87171',
+              fontWeight: '600'
+            }}
+          >
+            <Trash2 size={14} style={{ display: 'inline', marginRight: '4px' }} />
+            {confirmDelete ? 'Confirm Delete?' : 'Delete Chat'}
+          </button>
         </div>
+
+        {confirmClear && (
+          <p style={{ fontSize: '0.75rem', color: '#fbbf24', marginTop: '0.6rem' }}>
+            This clears all messages for you only. Others in the chat will not be affected.
+          </p>
+        )}
+        {confirmDelete && (
+          <p style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '0.6rem' }}>
+            This removes the chat from your account only. Other people will still see it.
+          </p>
+        )}
       </div>
 
       {/* Group Members Roster */}
@@ -84,6 +163,17 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin }) {
             ))}
           </div>
         </div>
+      )}
+
+      {showAddMembers && (
+        <AddMembersModal
+          room={room}
+          onClose={() => setShowAddMembers(false)}
+          onMembersAdded={(updatedRoom) => {
+            onMembersAdded(updatedRoom);
+            setShowAddMembers(false);
+          }}
+        />
       )}
     </div>
   );

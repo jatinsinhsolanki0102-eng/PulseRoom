@@ -1,10 +1,9 @@
 import jwt from 'jsonwebtoken';
 import { db } from './db.js';
+import { getJwtSecret } from './auth.js';
 
 // Active connected sockets tracking
 const userSockets = new Map(); // userId -> Set<socketId>
-
-const getJwtSecret = () => process.env.JWT_SECRET || '';
 
 export function setupSocketHandlers(io) {
   // Authentication Middleware for Socket.IO Handshake
@@ -126,7 +125,8 @@ export function setupSocketHandlers(io) {
     // 5. Message Reactions
     socket.on('toggle_reaction', async ({ messageId, roomId, emoji }) => {
       try {
-        const userId = socket.userId || data?.userId;
+        const userId = socket.userId || null;
+        if (!userId || !messageId || !roomId || !emoji) return;
         const updatedMsg = await db.toggleReaction(messageId, emoji, userId);
         if (updatedMsg) {
           io.to(roomId).emit('reaction_updated', { messageId, reactions: updatedMsg.reactions });

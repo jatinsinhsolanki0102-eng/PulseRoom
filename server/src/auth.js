@@ -1,12 +1,37 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 
-// Cryptographically safe secret fallback per instance if process.env.JWT_SECRET is omitted
-let dynamicSecret = process.env.JWT_SECRET;
-if (!dynamicSecret) {
-  console.warn('⚠️ WARNING: JWT_SECRET environment variable is not set. Using temporary instance key.');
-  dynamicSecret = 'pr_sec_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+// JWT_SECRET is loaded from server/.env by server.js via dotenv.config().
+// If it is missing, we persist a generated secret to a local file so that
+// tokens remain valid across server restarts / PC restarts (instead of a
+// throwaway per-process secret that invalidates every session on reboot).
+const SECRET_FILE = path.join(process.cwd(), 'data', '.jwt-secret');
+
+function loadOrCreatePersistentSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+
+  try {
+    if (!fs.existsSync(path.dirname(SECRET_FILE))) {
+      fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true });
+    }
+    if (fs.existsSync(SECRET_FILE)) {
+      const stored = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+      if (stored) return stored;
+    }
+    const secret = 'pr_' + crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SECRET_FILE, secret);
+    console.warn('🔑 Generated a persistent JWT secret (data/.jwt-secret). Sessions now survive restarts.');
+    return secret;
+  } catch (e) {
+    console.warn('⚠️ JWT_SECRET not set and could not persist one; using deterministic fallback. Set JWT_SECRET in server/.env for production.');
+    return 'pr_deterministic_fallback_' + crypto.createHash('sha256').update('pulseroom-stable-session-key').digest('hex').slice(0, 32);
+  }
 }
+
+let dynamicSecret = loadOrCreatePersistentSecret();
 
 const getJwtSecret = () => process.env.JWT_SECRET || dynamicSecret;
 
@@ -64,3 +89,5 @@ export function authenticateToken(req, res, next) {
     next();
   });
 }
+
+export { getJwtSecret };

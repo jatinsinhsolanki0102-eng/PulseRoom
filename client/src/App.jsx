@@ -128,23 +128,51 @@ function ChatAppContent() {
       });
     };
 
-    const handleMessageDeleted = (deletedMessageId) => {
+    const handleMessageDeletedForMe = ({ messageId, userId }) => {
+      if (userId !== user?.id) return;
       setMessages(prev => {
         const safePrev = Array.isArray(prev) ? prev : [];
-        return safePrev.filter(m => m.id !== deletedMessageId);
+        return safePrev.filter(m => m.id !== messageId);
       });
+    };
+
+    const handleRoomDeletedForMe = ({ roomId, userId }) => {
+      if (userId !== user?.id) return;
+      if (roomId === activeRoom?.id) {
+        setActiveRoom(null);
+        setMessages([]);
+      }
+    };
+
+    const handleRoomCleared = ({ roomId, userId }) => {
+      if (userId !== user?.id) return;
+      if (roomId === activeRoom?.id) {
+        setMessages([]);
+      }
+    };
+
+    const handleRoomMembersUpdated = (updatedRoom) => {
+      if (updatedRoom && updatedRoom.id === activeRoom?.id) {
+        setActiveRoom(updatedRoom);
+      }
     };
 
     socket.on('new_message', handleNewMessage);
     socket.on('reaction_updated', handleReactionUpdated);
-    socket.on('message_deleted', handleMessageDeleted);
+    socket.on('message_deleted_for_me', handleMessageDeletedForMe);
+    socket.on('room_deleted_for_me', handleRoomDeletedForMe);
+    socket.on('room_cleared', handleRoomCleared);
+    socket.on('room_members_updated', handleRoomMembersUpdated);
 
     return () => {
       socket.off('new_message', handleNewMessage);
       socket.off('reaction_updated', handleReactionUpdated);
-      socket.off('message_deleted', handleMessageDeleted);
+      socket.off('message_deleted_for_me', handleMessageDeletedForMe);
+      socket.off('room_deleted_for_me', handleRoomDeletedForMe);
+      socket.off('room_cleared', handleRoomCleared);
+      socket.off('room_members_updated', handleRoomMembersUpdated);
     };
-  }, [socket, activeRoom]);
+  }, [socket, activeRoom, user?.id]);
 
   const fetchRoomMessages = async (roomId) => {
     try {
@@ -191,6 +219,42 @@ function ChatAppContent() {
     } catch (err) {
       console.error(err);
     }
+  };
+
+  const handleDeleteChat = async () => {
+    if (!activeRoom) return;
+    try {
+      const res = await fetch(`/api/rooms/${activeRoom.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setActiveRoom(null);
+        setMessages([]);
+      }
+    } catch (err) {
+      console.error('Failed to delete chat:', err);
+    }
+  };
+
+  const handleClearChat = async () => {
+    if (!activeRoom) return;
+    try {
+      const res = await fetch(`/api/rooms/${activeRoom.id}/clear`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setMessages([]);
+      }
+    } catch (err) {
+      console.error('Failed to clear chat:', err);
+    }
+  };
+
+  const handleMembersAdded = (updatedRoom) => {
+    setActiveRoom(updatedRoom);
+    setShowChatInfo(false);
   };
 
   if (!user) {
@@ -262,6 +326,9 @@ function ChatAppContent() {
           room={activeRoom}
           onClose={() => setShowChatInfo(false)}
           onTogglePin={handleTogglePin}
+          onDeleteChat={handleDeleteChat}
+          onClearChat={handleClearChat}
+          onMembersAdded={handleMembersAdded}
         />
       )}
 

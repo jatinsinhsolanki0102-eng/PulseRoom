@@ -1,46 +1,81 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 
 const AuthContext = createContext();
 
+const TOKEN_KEY = 'pulseroom_token';
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [token, setToken] = useState(localStorage.getItem('pulseroom_token') || null);
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || null);
   const [loading, setLoading] = useState(true);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+
+  const logout = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken(null);
+    setUser(null);
+  };
+
+  const fetchProfile = async () => {
+    const res = await fetch('/api/users/me', {
+      headers: { Authorization: `Bearer ${tokenRef.current}` }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setUser(data);
+      return true;
+    }
+    if (res.status === 401 || res.status === 403) {
+      logout();
+      return false;
+    }
+    throw new Error(`Profile fetch failed with status ${res.status}`);
+  };
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('mode') === 'signup') {
-      localStorage.removeItem('pulseroom_token');
+      localStorage.removeItem(TOKEN_KEY);
       setToken(null);
       setUser(null);
       setLoading(false);
       return;
     }
 
-    if (token) {
-      fetchProfile();
-    } else {
+    if (!token) {
       setLoading(false);
+      return;
     }
-  }, [token]);
 
-  const fetchProfile = async () => {
-    try {
-      const res = await fetch('/api/users/me', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setUser(data);
-      } else {
-        logout();
+    let cancelled = false;
+    const restoreSession = async () => {
+      // After a PC restart the backend may still be booting, so retry a few
+      // times on transient network errors instead of giving up and logging out.
+      let attempt = 0;
+      while (!cancelled) {
+        try {
+          const restored = await fetchProfile();
+          if (restored) return;
+          return; // handled by fetchProfile (logout) already
+        } catch (e) {
+          attempt += 1;
+          if (cancelled) return;
+          if (attempt >= 5) {
+            console.error('Failed to restore session after retries:', e);
+            return;
+          }
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
       }
-    } catch (e) {
-      console.error('Failed to load profile:', e);
-    } finally {
-      setLoading(false);
-    }
-  };
+    };
+
+    restoreSession().finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+
+    return () => { cancelled = true; };
+  }, [token]);
 
   const login = async (email, password) => {
     const res = await fetch('/api/auth/login', {
@@ -50,9 +85,9 @@ export function AuthProvider({ children }) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Login failed.');
-    
+
     if (data.token) {
-      localStorage.setItem('pulseroom_token', data.token);
+      localStorage.setItem(TOKEN_KEY, data.token);
       setToken(data.token);
       setUser(data.user);
     }
@@ -67,19 +102,7 @@ export function AuthProvider({ children }) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Registration failed.');
-
-    if (data.token) {
-      localStorage.setItem('pulseroom_token', data.token);
-      setToken(data.token);
-      setUser(data.user);
-    }
     return data;
-  };
-
-  const logout = () => {
-    localStorage.removeItem('pulseroom_token');
-    setToken(null);
-    setUser(null);
   };
 
   return (

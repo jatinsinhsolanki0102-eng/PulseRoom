@@ -127,7 +127,7 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
           <button
             className="action-icon-btn"
             style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: '#ef4444' }}
-            title="Delete Message for Everyone"
+            title="Delete message for me"
             onClick={() => onDeleteMessage(message.id)}
           >
             <Trash2 size={14} />
