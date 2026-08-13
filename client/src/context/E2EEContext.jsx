@@ -373,7 +373,11 @@ export function E2EEProvider({ children }) {
   }, [user, fetchRecipientKey]);
 
   // ---------- Decrypt a message for display (with verification + replay checks) ----------
-  const decryptMessage = useCallback(async (message, roomId) => {
+  // opts.maxSeen: when decrypting a batch of history in order, this is the running
+  // counter for the sender so reloaded messages are NOT compared against the
+  // persisted live counter (which would falsely flag every old message as a
+  // "replayed or duplicate copy"). Omit it for a single live delivery.
+  const decryptMessage = useCallback(async (message, roomId, opts = {}) => {
     if (!message) return message;
     if (!message.e2ee) return message;
 
@@ -444,15 +448,30 @@ export function E2EEProvider({ children }) {
       }
 
       // Replay protection: per-sender counters must strictly increase per room.
+      // A batch (history) decrypt compares against the batch's own running counter
+      // (opts.maxSeen); a single live delivery compares against the persisted one.
       if (typeof inner.c === 'number' && String(message.sender_id) !== String(user.id)) {
-        const roomState = loadRoomState(user.id);
-        if (!roomState[roomId]) roomState[roomId] = { my: null, others: {}, seenCounters: {} };
-        const seen = roomState[roomId].seenCounters?.[message.sender_id] || 0;
+        const seen = opts.maxSeen ?? loadRoomState(user.id)[roomId]?.seenCounters?.[message.sender_id] ?? 0;
         if (inner.c <= seen) {
-          return { ...message, __replay: true, verified };
+          return { ...message, __replay: true, verified, __counter: inner.c };
         }
-        roomState[roomId].seenCounters = { ...(roomState[roomId].seenCounters || {}), [message.sender_id]: inner.c };
-        saveRoomState(user.id, roomState);
+        if (opts.maxSeen === undefined) {
+          const roomState = loadRoomState(user.id);
+          if (!roomState[roomId]) roomState[roomId] = { my: null, others: {}, seenCounters: {} };
+          roomState[roomId].seenCounters = { ...(roomState[roomId].seenCounters || {}), [message.sender_id]: inner.c };
+          saveRoomState(user.id, roomState);
+        }
+        return {
+          ...message,
+          decryptedText: inner.text,
+          decryptedMediaUrl: inner.mediaUrl,
+          decryptedMediaKey: inner.mediaKey,
+          decryptedMediaNonce: inner.mediaNonce,
+          decryptedMime: inner.mime,
+          decryptedType: inner.type,
+          verified,
+          __counter: inner.c
+        };
       }
 
       return {
@@ -477,12 +496,37 @@ export function E2EEProvider({ children }) {
 
   // ---------- Decrypt a list in order (sender-key dependencies preserved) ----------
   const decryptMessages = useCallback(async (messages, roomId) => {
+    // Oldest first so per-sender counters increase monotonically through the batch
+    // (the server already returns history ASC, but sort defensively anyway).
+    const list = (Array.isArray(messages) ? messages : []).slice()
+      .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    const running = {}; // sender_id -> highest counter decrypted in this batch
     const out = [];
-    for (const m of Array.isArray(messages) ? messages : []) {
-      out.push(await decryptMessage(m, roomId));
+    for (const m of list) {
+      const d = await decryptMessage(m, roomId, { maxSeen: running[m.sender_id] || 0 });
+      if (typeof d.__counter === 'number') running[m.sender_id] = d.__counter;
+      out.push(d);
+    }
+    // Persist the highest counters so live replay detection stays continuous.
+    if (Object.keys(running).length > 0) {
+      try {
+        const roomState = loadRoomState(user.id);
+        if (!roomState[roomId]) roomState[roomId] = { my: null, others: {}, seenCounters: {} };
+        const seen = { ...(roomState[roomId].seenCounters || {}) };
+        let changed = false;
+        for (const [sid, c] of Object.entries(running)) {
+          if (c > (seen[sid] || 0)) { seen[sid] = c; changed = true; }
+        }
+        if (changed) {
+          roomState[roomId].seenCounters = seen;
+          saveRoomState(user.id, roomState);
+        }
+      } catch (err) {
+        console.warn('E2EE seen-counter sync failed:', err.message);
+      }
     }
     return out;
-  }, [decryptMessage]);
+  }, [decryptMessage, user]);
 
   // ---------- Regenerate my sender key on any group membership change ----------
   useEffect(() => {
