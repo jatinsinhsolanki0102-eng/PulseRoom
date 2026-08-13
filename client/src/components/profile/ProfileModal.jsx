@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { X, Camera, User, Edit2, Sparkles, Check } from 'lucide-react';
+import { X, Camera, User, Edit2, Sparkles, Check, ShieldCheck, Ban } from 'lucide-react';
+
+const PRIVACY_OPTIONS = ['everyone', 'contacts', 'nobody'];
+const PRIVACY_LABELS = { everyone: 'Everyone', contacts: 'My Contacts', nobody: 'Nobody' };
 
 export default function ProfileModal({ isOpen, onClose }) {
   const { user, token, setUser } = useAuth();
@@ -13,6 +16,11 @@ export default function ProfileModal({ isOpen, onClose }) {
   const [successMsg, setSuccessMsg] = useState('');
   const [error, setError] = useState('');
 
+  // Privacy + Blocking state
+  const [privacy, setPrivacy] = useState({ last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone' });
+  const [blockedUsers, setBlockedUsers] = useState([]);
+  const [privacyMsg, setPrivacyMsg] = useState('');
+
   React.useEffect(() => {
     if (isOpen && user) {
       setUsername(user.username || '');
@@ -20,8 +28,69 @@ export default function ProfileModal({ isOpen, onClose }) {
       setAvatarUrl(user.avatar_url || '');
       setError('');
       setSuccessMsg('');
+      loadPrivacy();
+      loadBlockedUsers();
     }
   }, [isOpen, user]);
+
+  const loadPrivacy = async () => {
+    try {
+      const res = await fetch('/api/users/privacy', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPrivacy({ last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone', ...(data || {}) });
+      }
+    } catch (err) {
+      console.error('Failed to load privacy prefs:', err);
+    }
+  };
+
+  const loadBlockedUsers = async () => {
+    try {
+      const res = await fetch('/api/users/blocked', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) setBlockedUsers(await res.json());
+    } catch (err) {
+      console.error('Failed to load blocked users:', err);
+    }
+  };
+
+  const handlePrivacyChange = async (key, value) => {
+    const next = { ...privacy, [key]: value };
+    setPrivacy(next);
+    setPrivacyMsg('');
+    try {
+      const res = await fetch('/api/users/privacy', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ [key]: value })
+      });
+      if (!res.ok) throw new Error('Failed to update privacy settings.');
+      const updated = await res.json();
+      setPrivacy({ last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone', ...(updated || {}) });
+      setPrivacyMsg('Privacy settings updated.');
+      setTimeout(() => setPrivacyMsg(''), 2500);
+    } catch (err) {
+      setPrivacyMsg(err.message);
+    }
+  };
+
+  const handleUnblock = async (userId) => {
+    try {
+      const res = await fetch(`/api/users/${userId}/block`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setBlockedUsers(prev => prev.filter(u => u.id !== userId));
+      }
+    } catch (err) {
+      console.error('Failed to unblock user:', err);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -252,6 +321,91 @@ export default function ProfileModal({ isOpen, onClose }) {
             {saving ? 'Saving Changes...' : 'Save Profile Changes'}
           </button>
         </form>
+
+        {/* Privacy & Security Settings */}
+        <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--panel-border)', paddingTop: '1.25rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.75rem' }}>
+            <ShieldCheck size={18} style={{ color: 'var(--primary-accent)' }} />
+            <h3 style={{ fontFamily: 'Outfit', fontWeight: '700', fontSize: '1rem', margin: 0, color: 'var(--text-main)' }}>
+              Privacy Settings
+            </h3>
+          </div>
+
+          {privacyMsg && (
+            <div style={{
+              background: privacyMsg.includes('Failed') ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)',
+              border: `1px solid ${privacyMsg.includes('Failed') ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.3)'}`,
+              color: privacyMsg.includes('Failed') ? '#f87171' : '#10b981',
+              padding: '0.6rem 0.9rem',
+              borderRadius: '10px',
+              fontSize: '0.8rem',
+              marginBottom: '0.9rem'
+            }}>
+              {privacyMsg}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+            {[
+              { key: 'last_seen', label: 'Last Seen & Online' },
+              { key: 'profile_photo', label: 'Profile Photo' },
+              { key: 'status', label: 'About / Status' }
+            ].map(item => (
+              <div key={item.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+                <span style={{ fontSize: '0.85rem', color: 'var(--text-main)', fontWeight: '600' }}>{item.label}</span>
+                <div style={{ display: 'flex', gap: '0.3rem' }}>
+                  {PRIVACY_OPTIONS.map(opt => (
+                    <button
+                      key={opt}
+                      onClick={() => handlePrivacyChange(item.key, opt)}
+                      className="chip-btn"
+                      style={{
+                        padding: '0.35rem 0.7rem',
+                        borderRadius: '99px',
+                        fontSize: '0.72rem',
+                        background: (privacy[item.key] || 'everyone') === opt ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
+                        color: (privacy[item.key] || 'everyone') === opt ? 'white' : 'var(--text-muted)',
+                        fontWeight: '600'
+                      }}
+                    >
+                      {PRIVACY_LABELS[opt]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Blocked Users List */}
+        <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--panel-border)', paddingTop: '1.25rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.75rem' }}>
+            <Ban size={18} style={{ color: '#f87171' }} />
+            <h3 style={{ fontFamily: 'Outfit', fontWeight: '700', fontSize: '1rem', margin: 0, color: 'var(--text-main)' }}>
+              Blocked Users ({blockedUsers.length})
+            </h3>
+          </div>
+
+          {blockedUsers.length === 0 ? (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>No blocked users.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {blockedUsers.map(u => (
+                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.4rem 0.5rem', borderRadius: '10px', background: 'rgba(255,255,255,0.02)' }}>
+                  <img src={u.avatar_url || `https://api.dicebear.com/7.x/identicon/svg?seed=${u.username}`} alt={u.username} style={{ width: '32px', height: '32px', borderRadius: '50%' }} />
+                  <span style={{ flex: 1, fontWeight: '600', fontSize: '0.85rem' }}>{u.username}</span>
+                  <button
+                    onClick={() => handleUnblock(u.id)}
+                    className="chip-btn"
+                    style={{ padding: '0.35rem 0.7rem', borderRadius: '99px', fontSize: '0.72rem', background: 'rgba(16,185,129,0.12)', color: '#10b981', fontWeight: '700' }}
+                  >
+                    Unblock
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

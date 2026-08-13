@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.111.0",
@@ -19,6 +20,7 @@
     "nodemailer": "^9.0.3",
     "pg": "^8.11.5",
     "socket.io": "^4.7.5",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "web-push": "^3.6.7"
   }
 }

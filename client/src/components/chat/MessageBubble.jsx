@@ -2,21 +2,48 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useSocket } from '../../context/SocketContext';
 import VoicePlayer from './VoicePlayer';
-import { Smile, Reply, CheckCheck, Trash2 } from 'lucide-react';
+import DecryptedMedia from './DecryptedMedia';
+import { Smile, Reply, CheckCheck, Trash2, Flag, Lock, ShieldCheck, AlertTriangle } from 'lucide-react';
 
 const QUICK_EMOJIS = ['❤️', '👍', '🔥', '😂', '🎉', '😮'];
 
-export default function MessageBubble({ message, roomId, onReply, onDeleteMessage }) {
+export default function MessageBubble({ message, roomId, onReply, onDeleteMessage, onReportMessage }) {
   const { user } = useAuth();
   const { toggleReaction } = useSocket();
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
+  // Internal sender-key distribution/system messages are never rendered.
+  if (message.__system === 'sender_key') return null;
+
   const isSentByMe = message.sender_id === user?.id;
   const reactions = message.reactions || {};
+
+  // Decrypted view of an E2EE message (falls back to raw fields for plaintext).
+  const e2ee = Boolean(message.e2ee);
+  const bodyText = e2ee ? (message.decryptedText || (message.__undecryptable ? '' : '')) : message.text;
+  const mediaType = e2ee ? (message.decryptedType || null) : message.type;
+  const mediaUrl = e2ee ? (message.decryptedMediaUrl || null) : (message.media_url || null);
+  const mediaKey = e2ee ? (message.decryptedMediaKey || null) : null;
+  const mediaNonce = e2ee ? (message.decryptedMediaNonce || null) : null;
+  const mediaMime = e2ee ? (message.decryptedMime || null) : null;
+
+  const isReplyToEncrypted = message.reply_to && /"kind"\s*:\s*"msg"/.test(message.reply_to.text || '');
+
+  // WhatsApp-style read receipts: blue double-check once someone else read it
+  const readByOthers = (message.read_by || []).some(id => String(id) !== String(user?.id));
 
   const handleEmojiClick = (emoji) => {
     toggleReaction(message.id, roomId, emoji);
     setShowEmojiPicker(false);
+  };
+
+  const handleReport = () => {
+    if (!onReportMessage) return;
+    const reason = window.prompt('Report this message. Please describe why it should be reviewed:', '');
+    if (!reason) return;
+    onReportMessage(message.id, reason.trim()).then(ok => {
+      if (ok) alert('Thanks! The message has been reported for review.');
+    });
   };
 
   const formattedTime = new Date(message.created_at).toLocaleTimeString([], {
@@ -51,26 +78,74 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
             fontSize: '0.75rem',
             color: 'var(--text-muted)'
           }}>
-            <strong style={{ color: 'var(--text-main)' }}>{message.reply_to.sender_name}</strong>: {message.reply_to.text}
+            <strong style={{ color: 'var(--text-main)' }}>{message.reply_to.sender_name}</strong>: {isReplyToEncrypted ? '🔒 Encrypted message' : message.reply_to.text}
           </div>
         )}
 
-        {/* Media Content (Image Attachment) */}
-        {message.type === 'image' && message.media_url && (
+        {/* Undecryptable E2EE placeholder (e.g. key not yet received) */}
+        {e2ee && message.__undecryptable && (
+          <div style={{ fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
+            {message.__reason === 'auth' ? (
+              <span>
+                <Lock size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
+                This message can't be displayed because it was sent with a different encryption key.
+              </span>
+            ) : (
+              <span><Lock size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} /> Encrypted message</span>
+            )}
+          </div>
+        )}
+
+        {/* Replay / duplicate message warning */}
+        {e2ee && message.__replay && (
+          <div style={{ fontSize: '0.8rem', fontStyle: 'italic', color: '#fbbf24', marginBottom: '0.25rem' }}>
+            <AlertTriangle size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
+            This message appears to be a replayed or duplicate copy and is not displayed.
+          </div>
+        )}
+
+        {/* Encrypted media - fetch + decrypt in the browser */}
+        {!message.__undecryptable && mediaUrl && mediaKey && mediaNonce && (
+          <DecryptedMedia
+            mediaUrl={mediaUrl}
+            mediaKey={mediaKey}
+            mediaNonce={mediaNonce}
+            mime={mediaMime}
+            type={mediaType}
+            text={bodyText}
+          />
+        )}
+
+        {/* Plaintext media content (Image Attachment) */}
+        {!mediaKey && mediaType === 'image' && mediaUrl && (
           <div style={{ marginBottom: '0.5rem' }}>
             <img
-              src={message.media_url}
+              src={mediaUrl}
               alt="Attachment"
               style={{ maxWidth: '100%', maxHeight: '240px', borderRadius: '12px', display: 'block' }}
             />
           </div>
         )}
 
-        {/* Voice Note Audio Player */}
-        {message.type === 'audio' && message.media_url ? (
-          <VoicePlayer audioUrl={message.media_url} />
-        ) : (
-          <div>{message.text}</div>
+        {/* Plaintext Video Attachment */}
+        {!mediaKey && mediaType === 'video' && mediaUrl && (
+          <div style={{ marginBottom: '0.5rem' }}>
+            <video
+              src={mediaUrl}
+              controls
+              style={{ maxWidth: '100%', maxHeight: '240px', borderRadius: '12px', display: 'block' }}
+            />
+          </div>
+        )}
+
+        {/* Plaintext Voice Note Audio Player */}
+        {!mediaKey && mediaType === 'audio' && mediaUrl && (
+          <VoicePlayer audioUrl={mediaUrl} />
+        )}
+
+        {/* Text Body (plaintext + decrypted E2EE messages) */}
+        {!mediaUrl && !message.__undecryptable && (
+          <div>{bodyText || ''}</div>
         )}
 
         {/* Reactions List */}
@@ -94,8 +169,19 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
 
         {/* Bubble Timestamp & Status */}
         <div className="bubble-meta">
+          {e2ee && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px' }} title={message.verified ? 'End-to-end encrypted · sender identity verified' : 'End-to-end encrypted'}>
+              {message.verified ? (
+                <ShieldCheck size={12} style={{ color: '#10b981', verticalAlign: '-2px' }} />
+              ) : (
+                <Lock size={12} style={{ color: 'var(--text-dim)', verticalAlign: '-2px' }} />
+              )}
+            </span>
+          )}
           <span>{formattedTime}</span>
-          {isSentByMe && <CheckCheck size={14} style={{ color: '#38bdf8' }} />}
+          {isSentByMe && (
+            <CheckCheck size={14} style={{ color: readByOthers ? '#34b7f1' : '#8696a0' }} />
+          )}
         </div>
       </div>
 
@@ -131,6 +217,16 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
             onClick={() => onDeleteMessage(message.id)}
           >
             <Trash2 size={14} />
+          </button>
+        )}
+        {!isSentByMe && (
+          <button
+            className="action-icon-btn"
+            style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: '#f59e0b' }}
+            title="Report message"
+            onClick={handleReport}
+          >
+            <Flag size={14} />
           </button>
         )}
       </div>

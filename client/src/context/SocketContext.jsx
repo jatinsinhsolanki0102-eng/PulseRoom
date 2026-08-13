@@ -40,6 +40,13 @@ export function SocketProvider({ children }) {
       });
     });
 
+    // Full snapshot of currently-online users (sent on our connect)
+    newSocket.on('presence_snapshot', ({ onlineUserIds }) => {
+      if (Array.isArray(onlineUserIds)) {
+        setOnlineUsers(new Set(onlineUserIds.filter(id => id !== user.id)));
+      }
+    });
+
     newSocket.on('user_typing', ({ roomId, username, isTyping }) => {
       setTypingState(prev => ({
         ...prev,
@@ -58,7 +65,7 @@ export function SocketProvider({ children }) {
     }
   };
 
-  const sendMessage = async ({ roomId, text, type, mediaUrl, replyToId }) => {
+  const sendMessage = async ({ roomId, text, type, mediaUrl, replyToId, e2ee }) => {
     if (socket && socket.connected && user) {
       socket.emit('send_message', {
         roomId,
@@ -66,7 +73,8 @@ export function SocketProvider({ children }) {
         text,
         type: type || 'text',
         mediaUrl,
-        replyToId
+        replyToId,
+        e2ee: Boolean(e2ee)
       });
     } else if (token) {
       // REST HTTP Message Fallback when Socket.IO server is disconnected (e.g. Vercel Serverless environment)
@@ -77,7 +85,7 @@ export function SocketProvider({ children }) {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}`
           },
-          body: JSON.stringify({ roomId, text, type: type || 'text', mediaUrl, replyToId })
+          body: JSON.stringify({ roomId, text, type: type || 'text', mediaUrl, replyToId, e2ee: Boolean(e2ee) })
         });
       } catch (err) {
         console.error('HTTP REST sendMessage fallback error:', err);
@@ -101,6 +109,13 @@ export function SocketProvider({ children }) {
     }
   };
 
+  // WhatsApp-style read receipt: tell the server the active room is open
+  const markRead = (roomId) => {
+    if (socket && socket.connected && user && roomId) {
+      socket.emit('mark_read', { roomId, userId: user.id });
+    }
+  };
+
   return (
     <SocketContext.Provider value={{
       socket,
@@ -109,7 +124,8 @@ export function SocketProvider({ children }) {
       joinRoom,
       sendMessage,
       setTyping,
-      toggleReaction
+      toggleReaction,
+      markRead
     }}>
       {children}
     </SocketContext.Provider>

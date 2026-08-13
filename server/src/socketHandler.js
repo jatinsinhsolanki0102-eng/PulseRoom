@@ -1,109 +1,144 @@
 import jwt from 'jsonwebtoken';
 import { db } from './db.js';
 import { getJwtSecret } from './auth.js';
+import { sendPushToRoom } from './push.js';
 
 // Active connected sockets tracking
 const userSockets = new Map(); // userId -> Set<socketId>
 
 export function setupSocketHandlers(io) {
   // Authentication Middleware for Socket.IO Handshake
+  // A socket WITHOUT a valid JWT is rejected outright. The client can never
+  // choose its own identity - it is always derived from the verified token.
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, getJwtSecret());
-        if (decoded && decoded.id) {
-          socket.userId = decoded.id;
-        }
-      } catch (e) {
-        console.warn('Socket auth token verify failed:', e.message);
-      }
+    if (!token) {
+      return next(new Error('Authentication required.'));
     }
-    next();
+    try {
+      const decoded = jwt.verify(token, getJwtSecret());
+      if (!decoded || !decoded.id) {
+        return next(new Error('Invalid authentication token.'));
+      }
+      socket.userId = decoded.id;
+      return next();
+    } catch (e) {
+      console.warn('Socket auth token verify failed:', e.message);
+      return next(new Error('Invalid or expired authentication token.'));
+    }
   });
 
   io.on('connection', (socket) => {
-    let currentUserId = socket.userId || null;
+    const currentUserId = socket.userId;
 
-    // 1. Authenticate & Bind User Session
-    socket.on('user_connected', async (userId) => {
-      const boundUserId = socket.userId || userId;
-      if (!boundUserId) return;
-      currentUserId = boundUserId;
-      socket.userId = boundUserId;
+    // 1. Bind User Session - identity comes ONLY from the verified JWT.
+    socket.on('user_connected', async () => {
+      if (!currentUserId) return;
 
-      if (!userSockets.has(boundUserId)) {
-        userSockets.set(boundUserId, new Set());
+      if (!userSockets.has(currentUserId)) {
+        userSockets.set(currentUserId, new Set());
       }
-      userSockets.get(boundUserId).add(socket.id);
+      userSockets.get(currentUserId).add(socket.id);
 
       // Join personal user room for direct notifications
-      socket.join(`user:${boundUserId}`);
+      socket.join(`user:${currentUserId}`);
 
       // Update online status in database
-      await db.updateUserStatus(boundUserId, 'online');
+      await db.updateUserStatus(currentUserId, 'online');
 
-      // Join user to all their room channels
-      const rooms = await db.getUserRooms(boundUserId);
+      // Join user to all their room channels (only rooms they are a member of)
+      const rooms = await db.getUserRooms(currentUserId);
       for (const room of rooms) {
         socket.join(room.id);
       }
 
       // Broadcast presence update to all connected clients
-      io.emit('user_presence', { userId: boundUserId, status: 'online' });
-      console.log(`🔌 User connected socket: ${boundUserId} (${socket.id})`);
+      io.emit('user_presence', { userId: currentUserId, status: 'online' });
+
+      // Send a full snapshot of currently-online users so a newly connected
+      // client doesn't have to wait for other users' events.
+      socket.emit('presence_snapshot', { onlineUserIds: Array.from(userSockets.keys()) });
+      console.log(`🔌 User connected socket: ${currentUserId} (${socket.id})`);
     });
 
-    // 2. Join specific room dynamic channel
-    socket.on('join_room', (roomId) => {
+    // 2. Join specific room dynamic channel - membership verified server-side.
+    socket.on('join_room', async (roomId) => {
+      if (!currentUserId || !roomId) return;
+      const isMember = await db.isRoomMember(roomId, currentUserId);
+      if (!isMember) {
+        socket.emit('error_message', { error: 'You are not a member of this room.' });
+        return;
+      }
       socket.join(roomId);
       console.log(`👤 Socket ${socket.id} joined room ${roomId}`);
     });
 
-    // 3. Handle Real-Time Messaging (Enforcing socket.userId for authenticity)
+    // 3. Handle Real-Time Messaging (identity always from verified JWT).
     socket.on('send_message', async (data) => {
       try {
-        const { roomId, text, type, mediaUrl, replyToId } = data;
-        const senderId = socket.userId || data.senderId;
-        if (!roomId || !senderId || (!text && !mediaUrl)) return;
+        const { roomId, text, type, mediaUrl, replyToId, e2ee, forwarded, forwardedFrom } = data;
+        if (!currentUserId || !roomId || (!text && !mediaUrl)) return;
 
-        // Persist message to database
+        const isMember = await db.isRoomMember(roomId, currentUserId);
+        if (!isMember) {
+          socket.emit('error_message', { error: 'You are not a member of this room.' });
+          return;
+        }
+
+        // Blocked-user enforcement for 1-to-1 (2-member) rooms
+        const memberIds = await db.getRoomMemberIds(roomId);
+        if (memberIds.length === 2) {
+          const otherId = memberIds.find(id => id !== currentUserId);
+          if (otherId && (await db.isBlockedBetween(currentUserId, otherId))) {
+            socket.emit('error_message', { error: 'You cannot send messages to this user.' });
+            return;
+          }
+        }
+
+        // Persist message to database with the authenticated sender id
         const message = await db.createMessage({
           roomId,
-          senderId,
+          senderId: currentUserId,
           text,
           type: type || 'text',
           mediaUrl: mediaUrl || '',
-          replyToId: replyToId || null
+          replyToId: replyToId || null,
+          e2ee: Boolean(e2ee),
+          forwarded: Boolean(forwarded),
+          forwardedFrom: forwardedFrom || null
         });
 
-        const memberIds = await db.getRoomMemberIds(roomId);
-
-        // Broadcast to target room channel
-        io.to(roomId).emit('new_message', message);
-
-        // Also emit directly to every member's user channel
+        // Deliver exactly once per member socket. Every member socket joins its
+        // `user:<id>` channel on connect, so emitting only there (instead of also
+        // broadcasting to the room channel) prevents duplicate delivery - which
+        // previously made clients flag legitimate messages as "replayed".
         for (const memberId of memberIds) {
           io.to(`user:${memberId}`).emit('new_message', message);
         }
 
-        // Room Bridging Logic
-        const bridges = await db.getRoomBridges(roomId);
-        if (bridges && bridges.length > 0) {
-          for (const bridge of bridges) {
-            const bridgedText = `[Bridged Message]: ${text || ''}`;
-            const bridgedMsg = await db.createMessage({
-              roomId: bridge.target_room_id,
-              senderId,
-              text: bridgedText,
-              type: type || 'text',
-              mediaUrl: mediaUrl || '',
-              replyToId: null
-            });
-            io.to(bridge.target_room_id).emit('new_message', bridgedMsg);
-            const targetMembers = await db.getRoomMemberIds(bridge.target_room_id);
-            for (const tmId of targetMembers) {
-              io.to(`user:${tmId}`).emit('new_message', bridgedMsg);
+        // Push notification to offline members (never leak encrypted content)
+        sendPushToRoom(io, roomId, { id: currentUserId, username: message.sender_name }, message);
+
+        // Room Bridging Logic - skipped for E2EE messages. The sender's client
+        // re-encrypts a fresh copy to the target room (the server cannot decrypt).
+        if (!message.e2ee) {
+          const bridges = await db.getRoomBridges(roomId);
+          if (bridges && bridges.length > 0) {
+            for (const bridge of bridges) {
+              const bridgedText = `[Bridged Message]: ${text || ''}`;
+              const bridgedMsg = await db.createMessage({
+                roomId: bridge.target_room_id,
+                senderId: currentUserId,
+                text: bridgedText,
+                type: type || 'text',
+                mediaUrl: mediaUrl || '',
+                replyToId: null
+              });
+              // Single delivery per member socket (see note above on duplicate emits).
+              const targetMembers = await db.getRoomMemberIds(bridge.target_room_id);
+              for (const tmId of targetMembers) {
+                io.to(`user:${tmId}`).emit('new_message', bridgedMsg);
+              }
             }
           }
         }
@@ -113,21 +148,25 @@ export function setupSocketHandlers(io) {
       }
     });
 
-    // 4. Typing Indicators
-    socket.on('typing_start', ({ roomId, username }) => {
+    // 4. Typing Indicators (membership verified)
+    socket.on('typing_start', async ({ roomId, username }) => {
+      if (!currentUserId || !roomId) return;
+      if (!(await db.isRoomMember(roomId, currentUserId))) return;
       socket.to(roomId).emit('user_typing', { roomId, username, isTyping: true });
     });
 
-    socket.on('typing_stop', ({ roomId, username }) => {
+    socket.on('typing_stop', async ({ roomId, username }) => {
+      if (!currentUserId || !roomId) return;
+      if (!(await db.isRoomMember(roomId, currentUserId))) return;
       socket.to(roomId).emit('user_typing', { roomId, username, isTyping: false });
     });
 
-    // 5. Message Reactions
+    // 5. Message Reactions (membership verified)
     socket.on('toggle_reaction', async ({ messageId, roomId, emoji }) => {
       try {
-        const userId = socket.userId || null;
-        if (!userId || !messageId || !roomId || !emoji) return;
-        const updatedMsg = await db.toggleReaction(messageId, emoji, userId);
+        if (!currentUserId || !messageId || !roomId || !emoji) return;
+        if (!(await db.isRoomMember(roomId, currentUserId))) return;
+        const updatedMsg = await db.toggleReaction(messageId, emoji, currentUserId);
         if (updatedMsg) {
           io.to(roomId).emit('reaction_updated', { messageId, reactions: updatedMsg.reactions });
         }
@@ -136,10 +175,24 @@ export function setupSocketHandlers(io) {
       }
     });
 
+    // 5b. Read Receipts (WhatsApp-style: recipient marks messages as read)
+    socket.on('mark_read', async ({ roomId }) => {
+      if (!currentUserId || !roomId) return;
+      if (!(await db.isRoomMember(roomId, currentUserId))) return;
+      try {
+        const result = await db.markRoomMessagesRead(roomId, currentUserId);
+        if (result.messageIds && result.messageIds.length > 0) {
+          io.to(roomId).emit('read_receipt', result);
+        }
+      } catch (err) {
+        console.error('Error handling mark_read event:', err);
+      }
+    });
+
     // 6. Theme Updates Notification
     socket.on('update_theme', async ({ themePreferences }) => {
-      if (!socket.userId) return;
-      const updated = await db.updateUserTheme(socket.userId, themePreferences);
+      if (!currentUserId) return;
+      const updated = await db.updateUserTheme(currentUserId, themePreferences);
       socket.emit('theme_updated', updated);
     });
 

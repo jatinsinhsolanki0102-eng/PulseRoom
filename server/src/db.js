@@ -26,6 +26,10 @@ const memoryDb = {
   statuses: new Map(),
   pinned_chats: new Set(),
   pendingInvites: new Map(),
+  blocked: new Map(),
+  reports: new Map(),
+  pushSubscriptions: new Map(),
+  e2ee_keys: new Map(),
 };
 
 // ---------- Durable In-Memory Backup (data survives server restarts even without Postgres) ----------
@@ -41,7 +45,11 @@ function readSerializableMemoryDb() {
     messages: Object.fromEntries(memoryDb.messages),
     statuses: Object.fromEntries(memoryDb.statuses),
     pinned_chats: Array.from(memoryDb.pinned_chats),
-    pendingInvites: Object.fromEntries(memoryDb.pendingInvites)
+    pendingInvites: Object.fromEntries(memoryDb.pendingInvites),
+    blocked: Object.fromEntries(memoryDb.blocked),
+    reports: Object.fromEntries(memoryDb.reports),
+    pushSubscriptions: Object.fromEntries(memoryDb.pushSubscriptions),
+    e2ee_keys: Object.fromEntries(memoryDb.e2ee_keys)
   };
 }
 
@@ -54,6 +62,10 @@ function writeSerializableMemoryDb(data) {
   memoryDb.statuses = new Map(Object.entries(data.statuses || {}));
   memoryDb.pinned_chats = new Set(Array.isArray(data.pinned_chats) ? data.pinned_chats : []);
   memoryDb.pendingInvites = new Map(Object.entries(data.pendingInvites || {}));
+  memoryDb.blocked = new Map(Object.entries(data.blocked || {}));
+  memoryDb.reports = new Map(Object.entries(data.reports || {}));
+  memoryDb.pushSubscriptions = new Map(Object.entries(data.pushSubscriptions || {}));
+  memoryDb.e2ee_keys = new Map(Object.entries(data.e2ee_keys || {}));
 }
 
 function saveMemoryDbNow() {
@@ -103,6 +115,7 @@ export async function clearAllDatabaseData() {
   memoryDb.statuses.clear();
   memoryDb.pinned_chats.clear();
   if (memoryDb.pendingInvites) memoryDb.pendingInvites.clear();
+  if (memoryDb.e2ee_keys) memoryDb.e2ee_keys.clear();
 
   if (isPgConnected) {
     try {
@@ -132,7 +145,7 @@ export async function initDb() {
         password_hash VARCHAR(255) NOT NULL,
         avatar_url TEXT DEFAULT '',
         bio TEXT DEFAULT '',
-        status VARCHAR(20) DEFAULT 'online',
+        status VARCHAR(20) DEFAULT 'offline',
         last_seen TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         theme_preferences JSONB DEFAULT '{}',
         email_confirmed BOOLEAN DEFAULT FALSE,
@@ -228,6 +241,78 @@ export async function initDb() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_pending_invites_email ON pending_invites(invitee_email);`);
 
+    // 8. Blocked Users Table (WhatsApp-style privacy)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blocked_users (
+        blocker_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        blocked_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (blocker_id, blocked_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_blocked_blocker ON blocked_users(blocker_id);`);
+
+    // 9. Message Reports Table (moderation inbox)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS message_reports (
+        id VARCHAR(36) PRIMARY KEY,
+        message_id VARCHAR(36) REFERENCES messages(id) ON DELETE CASCADE,
+        reporter_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        room_id VARCHAR(36) REFERENCES rooms(id) ON DELETE CASCADE,
+        reason TEXT DEFAULT '',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reports_message ON message_reports(message_id);`);
+
+    // 10. Web Push Subscriptions Table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (endpoint)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);`);
+
+    // 11. Extra columns for new features
+    await client.query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS disappearing_timer INT DEFAULT 0;`);
+    await client.query(`UPDATE rooms SET disappearing_timer = 0 WHERE disappearing_timer IS NULL;`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS privacy_preferences JSONB DEFAULT '{}';`);
+    await client.query(`UPDATE users SET privacy_preferences = '{}' WHERE privacy_preferences IS NULL;`);
+    await client.query(`ALTER TABLE users ALTER COLUMN status SET DEFAULT 'offline';`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_timestamps JSONB DEFAULT '{}';`);
+    await client.query(`UPDATE messages SET read_timestamps = '{}' WHERE read_timestamps IS NULL;`);
+
+    // 12. End-to-End Encryption keys (server only stores PUBLIC keys - private keys never leave the client)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS e2ee_keys (
+        user_id VARCHAR(36) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        public_key TEXT NOT NULL,
+        signed_prekey TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // WhatsApp-style signed identity bundle: the ECDSA signing public key and the
+    // signature proving the ECDH identity key belongs to this user_id.
+    await client.query(`ALTER TABLE e2ee_keys ADD COLUMN IF NOT EXISTS sign_public_key TEXT;`);
+    await client.query(`ALTER TABLE e2ee_keys ADD COLUMN IF NOT EXISTS signature TEXT;`);
+
+    // 13. Extra message columns for E2EE + forwarding + delete-for-everyone
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS e2ee BOOLEAN DEFAULT FALSE;`);
+    await client.query(`UPDATE messages SET e2ee = FALSE WHERE e2ee IS NULL;`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded BOOLEAN DEFAULT FALSE;`);
+    await client.query(`UPDATE messages SET forwarded = FALSE WHERE forwarded IS NULL;`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from VARCHAR(36);`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for_everyone BOOLEAN DEFAULT FALSE;`);
+    await client.query(`UPDATE messages SET deleted_for_everyone = FALSE WHERE deleted_for_everyone IS NULL;`);
+    await client.query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS admins_only_post BOOLEAN DEFAULT FALSE;`);
+
     client.release();
     console.log('✅ PostgreSQL Schema & Indexes Verified.');
   } catch (err) {
@@ -235,6 +320,27 @@ export async function initDb() {
     console.log('🚀 Operating in High-Performance Resilient Dual Database Mode (In-Memory Postgres Emulation active).');
     isPgConnected = false;
     await loadMemoryDatabase();
+  }
+}
+
+// Load a user's pinned chats from PostgreSQL (theme_preferences.pinned_rooms).
+// Returns a Set of room ids, or null when running in memory-only mode (in that
+// case the durable memory DB already holds the pins). Also hydrates the
+// in-memory set so toggle/cleanup logic stays consistent within this session.
+async function loadPinnedChatsForUser(userId) {
+  if (!isPgConnected || !userId) return null;
+  try {
+    const res = await pool.query(`SELECT theme_preferences FROM users WHERE id = $1`, [userId]);
+    const prefs = res.rows[0]?.theme_preferences || {};
+    const pins = Array.isArray(prefs.pinned_rooms) ? prefs.pinned_rooms : [];
+    for (const roomId of pins) {
+      if (roomId) memoryDb.pinned_chats.add(`${userId}:${roomId}`);
+    }
+    return new Set(pins);
+  } catch (e) {
+    // On error, fall back to whatever the in-memory set holds.
+    console.warn('Load pinned chats error:', e.message);
+    return null;
   }
 }
 
@@ -270,7 +376,7 @@ export const db = {
         password_hash: passwordHash,
         avatar_url: avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${username}`,
         bio: bio || 'Available on PulseRoom',
-        status: 'online',
+        status: 'offline',
         last_seen: new Date().toISOString(),
         theme_preferences: defaultTheme,
         email_confirmed: emailConfirmed,
@@ -350,18 +456,49 @@ export const db = {
 
   getAllUsers: async (currentUserId) => {
     if (isPgConnected) {
+      const blockedIds = await db.getBlockedUserIds(currentUserId);
+      const blockerRows = await pool.query(`SELECT blocker_id FROM blocked_users WHERE blocked_id = $1`, [currentUserId]);
+      const exclude = new Set([...blockedIds, ...blockerRows.rows.map(r => r.blocker_id), currentUserId]);
+
       const res = await pool.query(
-        `SELECT id, username, email, avatar_url, bio, status, last_seen, theme_preferences, email_confirmed FROM users WHERE id != $1 ORDER BY username ASC`,
+        `SELECT id, username, email, avatar_url, bio, status, last_seen, privacy_preferences FROM users WHERE id != $1 ORDER BY username ASC`,
         [currentUserId]
       );
-      return res.rows;
+
+      const contactRes = await pool.query(
+        `SELECT DISTINCT rm2.user_id FROM room_members rm1 JOIN room_members rm2 ON rm1.room_id = rm2.room_id WHERE rm1.user_id = $1 AND rm2.user_id != $1`,
+        [currentUserId]
+      );
+      const contacts = new Set(contactRes.rows.map(r => r.user_id));
+
+      return res.rows
+        .filter(u => !exclude.has(u.id))
+        .map(u => {
+          const setting = (u.privacy_preferences || {}).last_seen || 'everyone';
+          const allowed = setting === 'everyone' || (setting === 'contacts' && contacts.has(u.id));
+          return {
+            id: u.id,
+            username: u.username,
+            email: u.email,
+            avatar_url: u.avatar_url,
+            bio: u.bio,
+            status: allowed ? u.status : 'offline',
+            last_seen: allowed ? u.last_seen : null,
+            privacy_preferences: u.privacy_preferences
+          };
+        });
     } else {
+      const myBlocked = await db.getBlockedUserIds(currentUserId);
+      const blockers = [];
+      for (const [blocker, list] of (memoryDb.blocked || new Map())) {
+        if (list.includes(currentUserId)) blockers.push(blocker);
+      }
+      const exclude = new Set([...myBlocked, ...blockers, currentUserId]);
       const users = [];
       for (const u of memoryDb.users.values()) {
-        if (u.id !== currentUserId) {
-          const { password_hash, ...safeUser } = u;
-          users.push(safeUser);
-        }
+        if (exclude.has(u.id)) continue;
+        const { password_hash, ...safeUser } = u;
+        users.push(safeUser);
       }
       return users;
     }
@@ -495,6 +632,295 @@ export const db = {
       return res.rows.map(r => r.user_id);
     } else {
       return memoryDb.room_members.filter(m => m.room_id === roomId).map(m => m.user_id);
+    }
+  },
+
+  isRoomMember: async (roomId, userId) => {
+    if (!roomId || !userId) return false;
+    const memberIds = await db.getRoomMemberIds(roomId);
+    return memberIds.includes(userId);
+  },
+
+  // ---------- Blocked Users ----------
+  blockUser: async (blockerId, blockedId) => {
+    if (blockerId === blockedId) return { blocked: false };
+    if (isPgConnected) {
+      await pool.query(
+        `INSERT INTO blocked_users (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [blockerId, blockedId]
+      );
+    } else {
+      if (!memoryDb.blocked) memoryDb.blocked = new Map();
+      if (!memoryDb.blocked.has(blockerId)) memoryDb.blocked.set(blockerId, []);
+      const list = memoryDb.blocked.get(blockerId);
+      if (!list.includes(blockedId)) list.push(blockedId);
+      scheduleMemoryDbSave();
+    }
+    return { blocked: true };
+  },
+
+  unblockUser: async (blockerId, blockedId) => {
+    if (isPgConnected) {
+      await pool.query(`DELETE FROM blocked_users WHERE blocker_id = $1 AND blocked_id = $2`, [blockerId, blockedId]);
+    } else {
+      if (memoryDb.blocked?.has(blockerId)) {
+        memoryDb.blocked.set(blockerId, memoryDb.blocked.get(blockerId).filter(id => id !== blockedId));
+        scheduleMemoryDbSave();
+      }
+    }
+    return { blocked: false };
+  },
+
+  getBlockedUserIds: async (userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT blocked_id FROM blocked_users WHERE blocker_id = $1`, [userId]);
+      return res.rows.map(r => r.blocked_id);
+    } else {
+      return (memoryDb.blocked?.get(userId)) || [];
+    }
+  },
+
+  isBlockedBetween: async (userAId, userBId) => {
+    if (!userAId || !userBId) return false;
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT 1 FROM blocked_users WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1) LIMIT 1`,
+        [userAId, userBId]
+      );
+      return res.rows.length > 0;
+    } else {
+      const a = await db.getBlockedUserIds(userAId);
+      const b = await db.getBlockedUserIds(userBId);
+      return a.includes(userBId) || b.includes(userAId);
+    }
+  },
+
+  // ---------- Message Reports ----------
+  reportMessage: async ({ messageId, reporterId, roomId, reason }) => {
+    const id = uuidv4();
+    if (isPgConnected) {
+      await pool.query(
+        `INSERT INTO message_reports (id, message_id, reporter_id, room_id, reason) VALUES ($1, $2, $3, $4, $5)`,
+        [id, messageId, reporterId, roomId, reason || '']
+      );
+    } else {
+      if (!memoryDb.reports) memoryDb.reports = new Map();
+      memoryDb.reports.set(id, { id, message_id: messageId, reporter_id: reporterId, room_id: roomId, reason: reason || '', created_at: new Date().toISOString() });
+      scheduleMemoryDbSave();
+    }
+    return { id };
+  },
+
+  // ---------- Privacy Preferences ----------
+  getPrivacyPrefs: async (userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT privacy_preferences FROM users WHERE id = $1`, [userId]);
+      return res.rows[0]?.privacy_preferences || {};
+    } else {
+      const u = memoryDb.users.get(userId);
+      return u?.privacy_preferences || {};
+    }
+  },
+
+  updatePrivacyPrefs: async (userId, prefs) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `UPDATE users SET privacy_preferences = $1 WHERE id = $2 RETURNING privacy_preferences`,
+        [JSON.stringify(prefs || {}), userId]
+      );
+      return res.rows[0]?.privacy_preferences || {};
+    } else {
+      const u = memoryDb.users.get(userId);
+      if (u) {
+        u.privacy_preferences = { ...(u.privacy_preferences || {}), ...(prefs || {}) };
+        scheduleMemoryDbSave();
+        return u.privacy_preferences;
+      }
+      return {};
+    }
+  },
+
+  // Returns true when the *viewer* is allowed to see target's last_seen/status.
+  canSeeLastSeen: async (viewerId, targetUser) => {
+    if (!targetUser) return false;
+    if (targetUser.status === 'online') return true;
+    const prefs = targetUser.privacy_preferences || {};
+    const setting = prefs.last_seen || 'everyone';
+    if (setting === 'everyone') return true;
+    if (setting === 'nobody') return false;
+    // 'contacts': only if they share a room (i.e. are in contact)
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT 1 FROM room_members rm1
+         JOIN room_members rm2 ON rm1.room_id = rm2.room_id
+         WHERE rm1.user_id = $1 AND rm2.user_id = $2 LIMIT 1`,
+        [viewerId, targetUser.id]
+      );
+      return res.rows.length > 0;
+    }
+    return memoryDb.room_members.some(m => m.user_id === viewerId &&
+      memoryDb.room_members.some(m2 => m2.user_id === targetUser.id && m2.room_id === m.room_id));
+  },
+
+  // ---------- Read Receipts ----------
+  markRoomMessagesRead: async (roomId, userId) => {
+    const timestamp = new Date().toISOString();
+    if (isPgConnected) {
+      // $4 carries a JSON array of the reader id: `COALESCE(read_by,'[]') || $4::jsonb`
+      // must receive a valid JSON value. Passing the raw UUID string as $2::jsonb
+      // made Postgres throw "invalid input syntax for type json", silently breaking
+      // read receipts (the handler caught the error and emitted nothing).
+      const res = await pool.query(
+        `UPDATE messages
+         SET read_by = CASE WHEN COALESCE(read_by, '[]') ? $2::text THEN read_by ELSE COALESCE(read_by, '[]') || $4::jsonb END,
+             read_timestamps = COALESCE(read_timestamps, '{}') || $3::jsonb
+         WHERE room_id = $1 AND sender_id != $2 AND NOT (COALESCE(read_by, '[]') ? $2::text)
+         RETURNING id`,
+        [roomId, userId, JSON.stringify({ [userId]: timestamp }), JSON.stringify([userId])]
+      );
+      return { roomId, userId, timestamp, messageIds: res.rows.map(r => r.id) };
+    } else {
+      const messageIds = [];
+      for (const msg of memoryDb.messages.values()) {
+        if (msg.room_id !== roomId || msg.sender_id === userId) continue;
+        if (Array.isArray(msg.read_by) && msg.read_by.includes(userId)) continue;
+        if (!Array.isArray(msg.read_by)) msg.read_by = [];
+        msg.read_by.push(userId);
+        if (!msg.read_timestamps) msg.read_timestamps = {};
+        msg.read_timestamps[userId] = timestamp;
+        messageIds.push(msg.id);
+      }
+      if (messageIds.length > 0) scheduleMemoryDbSave();
+      return { roomId, userId, timestamp, messageIds };
+    }
+  },
+
+  // ---------- Disappearing Messages ----------
+  setRoomDisappearingTimer: async (roomId, seconds) => {
+    const timer = Number(seconds) > 0 ? Math.floor(Number(seconds)) : 0;
+    if (isPgConnected) {
+      await pool.query(`UPDATE rooms SET disappearing_timer = $1 WHERE id = $2`, [timer, roomId]);
+    } else {
+      const room = memoryDb.rooms.get(roomId);
+      if (room) {
+        room.disappearing_timer = timer;
+        scheduleMemoryDbSave();
+      }
+    }
+    return { roomId, disappearing_timer: timer };
+  },
+
+  getRoomDisappearingTimer: async (roomId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT disappearing_timer FROM rooms WHERE id = $1`, [roomId]);
+      return res.rows[0]?.disappearing_timer || 0;
+    } else {
+      return memoryDb.rooms.get(roomId)?.disappearing_timer || 0;
+    }
+  },
+
+  cleanupExpiredDisappearingMessages: async () => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT m.room_id, array_agg(m.id) as ids
+         FROM messages m
+         JOIN rooms r ON r.id = m.room_id
+         WHERE r.disappearing_timer > 0
+           AND m.created_at < NOW() - (r.disappearing_timer * INTERVAL '1 second')
+         GROUP BY m.room_id`
+      );
+      for (const row of res.rows) {
+        await pool.query(`DELETE FROM messages WHERE id = ANY($1::varchar[])`, [row.ids]);
+      }
+      return res.rows.map(r => ({ roomId: r.room_id, messageIds: r.ids }));
+    } else {
+      const now = Date.now();
+      const expiredByRoom = new Map();
+      for (const [id, msg] of memoryDb.messages.entries()) {
+        const room = memoryDb.rooms.get(msg.room_id);
+        const timer = room?.disappearing_timer || 0;
+        if (timer > 0 && now - new Date(msg.created_at).getTime() > timer * 1000) {
+          if (!expiredByRoom.has(msg.room_id)) expiredByRoom.set(msg.room_id, []);
+          expiredByRoom.get(msg.room_id).push(id);
+        }
+      }
+      const result = [];
+      for (const [roomId, ids] of expiredByRoom) {
+        for (const id of ids) memoryDb.messages.delete(id);
+        result.push({ roomId, messageIds: ids });
+      }
+      if (result.length > 0) scheduleMemoryDbSave();
+      return result;
+    }
+  },
+
+  // ---------- Web Push Subscriptions ----------
+  savePushSubscription: async ({ userId, endpoint, p256dh, auth }) => {
+    const id = uuidv4();
+    if (isPgConnected) {
+      await pool.query(
+        `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (endpoint) DO UPDATE SET p256dh = $4, auth = $5`,
+        [id, userId, endpoint, p256dh, auth]
+      );
+    } else {
+      if (!memoryDb.pushSubscriptions) memoryDb.pushSubscriptions = new Map();
+      memoryDb.pushSubscriptions.set(endpoint, { id, user_id: userId, endpoint, p256dh, auth, created_at: new Date().toISOString() });
+      scheduleMemoryDbSave();
+    }
+    return { ok: true };
+  },
+
+  removePushSubscription: async (endpoint) => {
+    if (isPgConnected) {
+      await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
+    } else {
+      if (memoryDb.pushSubscriptions?.has(endpoint)) {
+        memoryDb.pushSubscriptions.delete(endpoint);
+        scheduleMemoryDbSave();
+      }
+    }
+  },
+
+  getPushSubscriptions: async (userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`,
+        [userId]
+      );
+      return res.rows;
+    } else {
+      return Array.from((memoryDb.pushSubscriptions || new Map()).values())
+        .filter(s => s.user_id === userId)
+        .map(s => ({ endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth }));
+    }
+  },
+
+  getBridgesForUser: async (userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT rb.*, r.name AS target_room_name, r.avatar_url AS target_room_avatar
+         FROM room_bridges rb
+         JOIN rooms r ON rb.target_room_id = r.id
+         JOIN room_members rm ON rm.room_id = rb.source_room_id
+         WHERE rm.user_id = $1`,
+        [userId]
+      );
+      return res.rows;
+    } else {
+      const bridges = [];
+      for (const b of memoryDb.room_bridges.values()) {
+        const isMember = memoryDb.room_members.some(m => m.room_id === b.source_room_id && m.user_id === userId);
+        if (!isMember) continue;
+        const targetRoom = memoryDb.rooms.get(b.target_room_id);
+        bridges.push({
+          ...b,
+          target_room_name: targetRoom ? targetRoom.name : 'Linked Room',
+          target_room_avatar: targetRoom ? targetRoom.avatar_url : ''
+        });
+      }
+      return bridges;
     }
   },
 
@@ -655,7 +1081,13 @@ export const db = {
     if (isPgConnected) {
       const res = await pool.query(
         `SELECT r.*, rm.role,
-                (SELECT JSON_BUILD_OBJECT('id', m.id, 'text', m.text, 'sender_id', m.sender_id, 'created_at', m.created_at)
+                (SELECT COUNT(*) FROM messages m
+                 WHERE m.room_id = r.id
+                   AND m.sender_id != $1
+                   AND NOT (COALESCE(m.deleted_for, '[]') ? $1)
+                   AND NOT COALESCE(m.deleted_for_everyone, FALSE)
+                   AND NOT (COALESCE(m.read_by, '[]') ? $1)) as unread_count,
+                (SELECT JSON_BUILD_OBJECT('id', m.id, 'text', m.text, 'sender_id', m.sender_id, 'created_at', m.created_at, 'e2ee', COALESCE(m.e2ee, FALSE), 'type', COALESCE(m.type, 'text'))
                  FROM messages m
                  WHERE m.room_id = r.id AND NOT (COALESCE(m.deleted_for, '[]') ? $1)
                  ORDER BY m.created_at DESC LIMIT 1) as last_message
@@ -667,16 +1099,30 @@ export const db = {
       );
 
       const rooms = res.rows;
+
+      // Pinned chats are persisted per-user in theme_preferences.pinned_rooms so
+      // they survive server restarts (PostgreSQL), not just the in-memory set.
+      const pinnedSet = await loadPinnedChatsForUser(userId);
+
       for (const room of rooms) {
         if (room.type === 'private') {
           const partnerRes = await pool.query(
-            `SELECT u.id, u.username, u.avatar_url, u.status, u.bio
+            `SELECT u.id, u.username, u.avatar_url, u.status, u.last_seen, u.bio, u.privacy_preferences
              FROM users u
              JOIN room_members rm ON u.id = rm.user_id
              WHERE rm.room_id = $1 AND u.id != $2`,
             [room.id, userId]
           );
-          room.partner = partnerRes.rows[0] || null;
+          const partner = partnerRes.rows[0] || null;
+          if (partner) {
+            const setting = (partner.privacy_preferences || {}).last_seen || 'everyone';
+            const allowed = setting !== 'nobody';
+            if (!allowed && partner.status !== 'online') {
+              partner.status = 'offline';
+              partner.last_seen = null;
+            }
+          }
+          room.partner = partner;
         } else {
           const membersRes = await pool.query(
             `SELECT u.id, u.username, u.avatar_url, rm.role
@@ -687,7 +1133,8 @@ export const db = {
           );
           room.members = membersRes.rows;
         }
-        room.is_pinned = memoryDb.pinned_chats.has(`${userId}:${room.id}`);
+        room.is_pinned = pinnedSet ? pinnedSet.has(room.id) : memoryDb.pinned_chats.has(`${userId}:${room.id}`);
+        room.disappearing_seconds = room.disappearing_timer || 0;
       }
       return rooms;
     } else {
@@ -700,12 +1147,18 @@ export const db = {
         if (Array.isArray(room.cleared_by) && room.cleared_by.includes(userId)) continue;
 
         const roomCopy = { ...room, role: entry.role, is_pinned: memoryDb.pinned_chats.has(`${userId}:${room.id}`) };
+        roomCopy.disappearing_seconds = roomCopy.disappearing_timer || 0;
 
         const roomMsgs = Array.from(memoryDb.messages.values())
           .filter(m => m.room_id === room.id && (!Array.isArray(m.deleted_for) || !m.deleted_for.includes(userId)))
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
         roomCopy.last_message = roomMsgs[0] || null;
+        roomCopy.unread_count = roomMsgs.filter(m =>
+          m.sender_id !== userId &&
+          !m.deleted_for_everyone &&
+          (!Array.isArray(m.read_by) || !m.read_by.includes(userId))
+        ).length;
 
         if (room.type === 'private') {
           const partnerEntry = memoryDb.room_members.find(m => m.room_id === room.id && m.user_id !== userId);
@@ -713,6 +1166,12 @@ export const db = {
             const partnerUser = memoryDb.users.get(partnerEntry.user_id);
             if (partnerUser) {
               const { password_hash, ...safePartner } = partnerUser;
+              const setting = (safePartner.privacy_preferences || {}).last_seen || 'everyone';
+              const allowed = setting !== 'nobody';
+              if (!allowed && safePartner.status !== 'online') {
+                safePartner.status = 'offline';
+                safePartner.last_seen = null;
+              }
               roomCopy.partner = safePartner;
             }
           }
@@ -817,16 +1276,16 @@ export const db = {
   },
 
   // Message Operations
-  createMessage: async ({ roomId, senderId, text, type = 'text', mediaUrl = '', replyToId = null }) => {
+  createMessage: async ({ roomId, senderId, text, type = 'text', mediaUrl = '', replyToId = null, e2ee = false, forwarded = false, forwardedFrom = null }) => {
     const id = uuidv4();
     const createdAt = new Date().toISOString();
 
     if (isPgConnected) {
       const res = await pool.query(
-        `INSERT INTO messages (id, room_id, sender_id, text, type, media_url, reply_to_id, read_by, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `INSERT INTO messages (id, room_id, sender_id, text, type, media_url, reply_to_id, read_by, e2ee, forwarded, forwarded_from, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING *`,
-        [id, roomId, senderId, text, type, mediaUrl, replyToId, JSON.stringify([senderId]), createdAt]
+        [id, roomId, senderId, text, type, mediaUrl, replyToId, JSON.stringify([senderId]), Boolean(e2ee), Boolean(forwarded), forwardedFrom || null, createdAt]
       );
 
       const senderRes = await pool.query(`SELECT username, avatar_url FROM users WHERE id = $1`, [senderId]);
@@ -851,7 +1310,11 @@ export const db = {
         reactions: {},
         reply_to_id: replyToId,
         read_by: [senderId],
+        read_timestamps: {},
         deleted_for: [],
+        e2ee: Boolean(e2ee),
+        forwarded: Boolean(forwarded),
+        forwarded_from: forwardedFrom || null,
         created_at: createdAt
       };
       memoryDb.messages.set(id, message);
@@ -902,7 +1365,12 @@ export const db = {
             };
           }
         }
-        return { ...m, reply_to: replyTo };
+        return {
+          ...m,
+          read_by: Array.isArray(m.read_by) ? m.read_by : [],
+          read_timestamps: m.read_timestamps || {},
+          reply_to: replyTo
+        };
       });
     }
   },
@@ -1162,5 +1630,234 @@ export const db = {
       }
       return null;
     }
+  },
+
+  // ---------- End-to-End Encryption (public keys only - private keys stay on the client) ----------
+  setE2EEKey: async ({ userId, publicKey, signedPrekey, signPublicKey, signature }) => {
+    if (!userId || !publicKey) return null;
+    if (isPgConnected) {
+      const res = await pool.query(
+        `INSERT INTO e2ee_keys (user_id, public_key, signed_prekey, sign_public_key, signature)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id) DO UPDATE SET public_key = $2, signed_prekey = $3, sign_public_key = $4, signature = $5, updated_at = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [userId, publicKey, signedPrekey || null, signPublicKey || null, signature || null]
+      );
+      return res.rows[0];
+    } else {
+      const record = {
+        user_id: userId,
+        public_key: publicKey,
+        signed_prekey: signedPrekey || '',
+        sign_public_key: signPublicKey || '',
+        signature: signature || '',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      memoryDb.e2ee_keys.set(userId, record);
+      scheduleMemoryDbSave();
+      return record;
+    }
+  },
+
+  getE2EEKey: async (userId) => {
+    if (!userId) return null;
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT user_id, public_key, signed_prekey, sign_public_key, signature FROM e2ee_keys WHERE user_id = $1`, [userId]);
+      return res.rows[0] || null;
+    } else {
+      return memoryDb.e2ee_keys.get(userId) || null;
+    }
+  },
+
+  hasE2EEKey: async (userId) => {
+    const key = await db.getE2EEKey(userId);
+    return Boolean(key && key.public_key);
+  },
+
+  // ---------- Group Administration ----------
+  getRoomMemberRole: async (roomId, userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`SELECT role FROM room_members WHERE room_id = $1 AND user_id = $2`, [roomId, userId]);
+      return res.rows[0]?.role || null;
+    } else {
+      const entry = memoryDb.room_members.find(m => m.room_id === roomId && m.user_id === userId);
+      return entry ? entry.role : null;
+    }
+  },
+
+  setRoomMemberRole: async (roomId, userId, role) => {
+    if (role !== 'admin' && role !== 'member') return null;
+    if (isPgConnected) {
+      const res = await pool.query(
+        `UPDATE room_members SET role = $1 WHERE room_id = $2 AND user_id = $3 RETURNING room_id, user_id, role`,
+        [role, roomId, userId]
+      );
+      return res.rows[0] || null;
+    } else {
+      const entry = memoryDb.room_members.find(m => m.room_id === roomId && m.user_id === userId);
+      if (!entry) return null;
+      entry.role = role;
+      scheduleMemoryDbSave();
+      return { room_id: roomId, user_id: userId, role };
+    }
+  },
+
+  removeRoomMember: async (roomId, userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(`DELETE FROM room_members WHERE room_id = $1 AND user_id = $2 RETURNING user_id`, [roomId, userId]);
+      return res.rows[0] || null;
+    } else {
+      const before = memoryDb.room_members.length;
+      memoryDb.room_members = memoryDb.room_members.filter(m => !(m.room_id === roomId && m.user_id === userId));
+      if (memoryDb.room_members.length !== before) scheduleMemoryDbSave();
+      return { user_id: userId };
+    }
+  },
+
+  updateRoom: async (roomId, { name, description, avatarUrl, themeColor }) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `UPDATE rooms
+         SET name = COALESCE($2, name),
+             description = COALESCE($3, description),
+             avatar_url = COALESCE($4, avatar_url),
+             theme_color = COALESCE($5, theme_color)
+         WHERE id = $1
+         RETURNING *`,
+        [roomId, name || null, description || null, avatarUrl || null, themeColor || null]
+      );
+      return res.rows[0] || null;
+    } else {
+      const room = memoryDb.rooms.get(roomId);
+      if (!room) return null;
+      if (name) room.name = name;
+      if (description !== undefined) room.description = description;
+      if (avatarUrl) room.avatar_url = avatarUrl;
+      if (themeColor) room.theme_color = themeColor;
+      scheduleMemoryDbSave();
+      return room;
+    }
+  },
+
+  // ---------- Message Search Within a Chat ----------
+  searchRoomMessages: async (roomId, userId, query) => {
+    if (!query || !String(query).trim()) return [];
+    const q = String(query).trim();
+    if (isPgConnected) {
+      const res = await pool.query(
+        `SELECT m.*, u.username as sender_name, u.avatar_url as sender_avatar
+         FROM messages m
+         LEFT JOIN users u ON m.sender_id = u.id
+         WHERE m.room_id = $1
+           AND NOT (COALESCE(m.deleted_for, '[]') ? $2)
+           AND NOT COALESCE(m.deleted_for_everyone, FALSE)
+           AND m.type = 'text'
+           AND m.text ILIKE $3
+         ORDER BY m.created_at DESC
+         LIMIT 50`,
+        [roomId, userId, `%${q}%`]
+      );
+      return res.rows;
+    } else {
+      return Array.from(memoryDb.messages.values())
+        .filter(m =>
+          m.room_id === roomId &&
+          (!Array.isArray(m.deleted_for) || !m.deleted_for.includes(userId)) &&
+          !m.deleted_for_everyone &&
+          m.type === 'text' &&
+          m.text && String(m.text).toLowerCase().includes(q.toLowerCase())
+        )
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, 50);
+    }
+  },
+
+  // ---------- Delete for Everyone (WhatsApp-style) ----------
+  deleteMessageForEveryone: async (messageId, userId) => {
+    if (isPgConnected) {
+      const res = await pool.query(
+        `UPDATE messages
+         SET deleted_for_everyone = TRUE,
+             text = '',
+             media_url = '',
+             type = 'deleted'
+         WHERE id = $1 AND sender_id = $2
+         RETURNING id, room_id`,
+        [messageId, userId]
+      );
+      return res.rows[0] || null;
+    } else {
+      const msg = memoryDb.messages.get(messageId);
+      if (!msg || msg.sender_id !== userId) return null;
+      msg.deleted_for_everyone = true;
+      msg.text = '';
+      msg.media_url = '';
+      msg.type = 'deleted';
+      scheduleMemoryDbSave();
+      return { id: msg.id, room_id: msg.room_id };
+    }
+  },
+
+  // ---------- Forward Messages ----------
+  forwardMessage: async ({ roomId, senderId, text, type, mediaUrl, originalMessageId, e2ee }) => {
+    const id = uuidv4();
+    const createdAt = new Date().toISOString();
+    const payload = {
+      roomId,
+      senderId,
+      text,
+      type: type || 'text',
+      mediaUrl: mediaUrl || '',
+      replyToId: null,
+      forwarded: true,
+      forwardedFrom: originalMessageId || null,
+      e2ee: Boolean(e2ee)
+    };
+    if (isPgConnected) {
+      const res = await pool.query(
+        `INSERT INTO messages (id, room_id, sender_id, text, type, media_url, reply_to_id, read_by, forwarded, forwarded_from, e2ee, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, $11)
+         RETURNING *`,
+        [id, roomId, senderId, text, type || 'text', mediaUrl || '', null, JSON.stringify([senderId]), originalMessageId || null, Boolean(e2ee), createdAt]
+      );
+      const senderRes = await pool.query(`SELECT username, avatar_url FROM users WHERE id = $1`, [senderId]);
+      const sender = senderRes.rows[0];
+      return {
+        ...res.rows[0],
+        sender_name: sender ? sender.username : 'Unknown',
+        sender_avatar: sender ? sender.avatar_url : '',
+        forwarded: true
+      };
+    } else {
+      const sender = memoryDb.users.get(senderId);
+      const message = {
+        id,
+        room_id: roomId,
+        sender_id: senderId,
+        sender_name: sender ? sender.username : 'User',
+        sender_avatar: sender ? sender.avatar_url : '',
+        text,
+        type: type || 'text',
+        media_url: mediaUrl || '',
+        reactions: {},
+        reply_to_id: null,
+        read_by: [senderId],
+        read_timestamps: {},
+        deleted_for: [],
+        forwarded: true,
+        forwarded_from: originalMessageId || null,
+        e2ee: Boolean(e2ee),
+        created_at: createdAt
+      };
+      memoryDb.messages.set(id, message);
+      scheduleMemoryDbSave();
+      return message;
+    }
+  },
+
+  // Delete the room membership row entirely for a group that was dissolved
+  deleteGroupRoom: async (roomId) => {
+    return db.deleteRoom(roomId);
   }
 };

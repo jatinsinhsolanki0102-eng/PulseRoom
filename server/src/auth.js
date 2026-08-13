@@ -8,6 +8,10 @@ import crypto from 'crypto';
 // If it is missing, we persist a generated secret to a local file so that
 // tokens remain valid across server restarts / PC restarts (instead of a
 // throwaway per-process secret that invalidates every session on reboot).
+//
+// SECURITY: There is intentionally NO hardcoded / deterministic fallback.
+// A predictable secret lets anyone forge tokens for any user and read every
+// chat. If we cannot obtain a strong secret, we fail closed and refuse to start.
 const SECRET_FILE = path.join(process.cwd(), 'data', '.jwt-secret');
 
 function loadOrCreatePersistentSecret() {
@@ -26,8 +30,8 @@ function loadOrCreatePersistentSecret() {
     console.warn('🔑 Generated a persistent JWT secret (data/.jwt-secret). Sessions now survive restarts.');
     return secret;
   } catch (e) {
-    console.warn('⚠️ JWT_SECRET not set and could not persist one; using deterministic fallback. Set JWT_SECRET in server/.env for production.');
-    return 'pr_deterministic_fallback_' + crypto.createHash('sha256').update('pulseroom-stable-session-key').digest('hex').slice(0, 32);
+    console.error('❌ JWT_SECRET is not set and could not be persisted. Set JWT_SECRET in server/.env (or server/data/.jwt-secret) before starting.');
+    throw new Error('A strong JWT_SECRET is required. Refusing to start without one.');
   }
 }
 

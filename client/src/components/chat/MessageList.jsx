@@ -1,8 +1,10 @@
 import React, { useEffect, useRef } from 'react';
 import MessageBubble from './MessageBubble';
 
-export default function MessageList({ messages, roomId, typingUser, onReply, onDeleteMessage }) {
+export default function MessageList({ messages, roomId, typingUser, onReply, onDeleteMessage, onReportMessage }) {
   const bottomRef = useRef(null);
+
+  const visibleMessages = (Array.isArray(messages) ? messages : []).filter(m => m && m.__system !== 'sender_key');
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -10,7 +12,7 @@ export default function MessageList({ messages, roomId, typingUser, onReply, onD
 
   return (
     <div className="message-feed">
-      {messages.length === 0 ? (
+      {visibleMessages.length === 0 ? (
         <div style={{
           margin: 'auto',
           textAlign: 'center',
@@ -24,13 +26,14 @@ export default function MessageList({ messages, roomId, typingUser, onReply, onD
           <p style={{ fontSize: '0.85rem' }}>Send a message or voice note to initiate real-time chat!</p>
         </div>
       ) : (
-        messages.map(msg => (
+        visibleMessages.map(msg => (
           <MessageBubble
             key={msg.id}
             message={msg}
             roomId={roomId}
             onReply={onReply}
             onDeleteMessage={onDeleteMessage}
+            onReportMessage={onReportMessage}
           />
         ))
       )}

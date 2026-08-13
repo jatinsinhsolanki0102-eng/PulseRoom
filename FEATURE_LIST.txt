@@ -1,0 +1,161 @@
+================================================================================
+ PULSEROOM - USER ENGAGEMENT FEATURE LIST
+ Updated: 11-Aug-2026
+ Status legend: [✓] DONE   [ ] PENDING   [~] PARTIAL
+================================================================================
+
+----------------------------------------------------------------------
+ 1. AUTH & ONBOARDING
+----------------------------------------------------------------------
+[✓] Sign up with email + password
+[✓] Email confirmation before login (with confirmation token)
+[✓] Resend confirmation email
+[✓] Auto-confirm fallback if mail provider fails
+[✓] Login / Logout (JWT)
+[✓] Forgot / reset password
+[✓] Invite-by-email -> chat auto-opens when friend confirms signup
+
+----------------------------------------------------------------------
+ 2. PROFILE & IDENTITY
+----------------------------------------------------------------------
+[✓] Profile photo upload (image) + random avatar
+[✓] Username + About/bio
+[✓] User directory (search by name/email)
+
+----------------------------------------------------------------------
+ 3. CONVERSATIONS
+----------------------------------------------------------------------
+[✓] 1:1 private chat (auto-created on invite / directory click)
+[✓] Group rooms (create, name, photo, description, theme color)
+[✓] Add members to existing group
+[✓] Group-to-group room bridging (unique feature)
+[✓] Invite friend by email
+[✓] Search chats / groups / users
+[✓] Pin / unpin chats
+[✓] Pinned chats persisted to PostgreSQL (survive restarts)  << NEW
+
+----------------------------------------------------------------------
+ 4. MESSAGING
+----------------------------------------------------------------------
+[✓] Real-time send/receive via Socket.IO
+[✓] Text messages
+[✓] Image attachments
+[✓] Video attachments
+[✓] Audio / voice notes
+[✓] Reply-to-message
+[✓] Emoji reactions (per-user counts)
+[✓] Delete for me
+[✓] Typing indicators
+[✓] Read receipts (grey/blue double-check)  << NEW
+[✓] Disappearing messages (Off / 24h / 7d / 90d)  << NEW
+[✓] Online presence (live socket snapshot, no stale DB status)  << NEW
+[ ] Delete for everyone
+[ ] Edit messages
+[ ] Forward messages
+[ ] Message search inside a chat
+[ ] Media gallery per chat
+[ ] Scheduled / starred messages
+[ ] Voice / video calls
+
+----------------------------------------------------------------------
+ 5. PERSONALIZATION (key differentiator)
+----------------------------------------------------------------------
+[✓] Theme Studio: chat bar shape & position
+[✓] Bubble colors (sender / receiver)
+[✓] Background wallpapers
+[✓] Font family / size
+[✓] Send button style (gradient circle, etc.)
+[✓] Per-user theme saved to backend
+
+----------------------------------------------------------------------
+ 6. STATUS / STORIES
+----------------------------------------------------------------------
+[✓] Create text status (with background color)
+[✓] Create image / video status
+[✓] 24-hour status tray grouped by user
+[✓] View tracking (seen / allSeen)
+[ ] Status reactions / replies
+[ ] Status expiration job (currently memory only)
+
+----------------------------------------------------------------------
+ 7. PRIVACY & SAFETY
+----------------------------------------------------------------------
+[✓] Block / unblock users  << NEW
+[✓] Blocked-users list with unblock  << NEW
+[✓] Privacy controls: Last Seen & Online / Profile Photo / About  << NEW
+      (Everyone / My Contacts / Nobody)
+[✓] Last-seen + online masked per privacy setting (server-side)  << NEW
+[✓] Report message (moderation)  << NEW
+[✓] Block enforcement: cannot message or start chat when blocked  << NEW
+[✓] Blocked users hidden from directory  << NEW
+[✓] End-to-end encryption (Signal-style, like WhatsApp)  << NEW
+      - ECDH P-256 identity + ephemeral keys (forward secrecy)
+      - HKDF-SHA256 key derivation + AES-256-GCM authenticated encryption
+      - Group chats: per-sender "Sender Keys" (Signal SenderKey pattern)
+      - Media encrypted client-side before upload; key travels in envelope
+      - Self-encrypted copy so senders read back their own messages
+      - Private keys never leave the browser; server relays unreadable ciphertext
+      - E2EE lock indicators on bubbles + chat header
+
+----------------------------------------------------------------------
+ 8. NOTIFICATIONS
+----------------------------------------------------------------------
+[✓] Web Push notifications to offline members  << NEW
+[✓] VAPID key auto-generation + env override
+[✓] Service worker (sw.js): notification click -> focus app
+[ ] Notification sound / badge count
+[ ] Deep-link / open specific room from notification
+[ ] Mute per-chat notifications
+[ ] Unread badge counts on chats
+
+----------------------------------------------------------------------
+ 9. DATA & RELIABILITY
+----------------------------------------------------------------------
+[✓] PostgreSQL schema + migrations (auto ALTER)
+[✓] Durable in-memory fallback DB (survives restarts)
+[✓] Clear chat (for me)
+[✓] Delete chat (for me)
+[✓] Security headers (nosniff, X-Frame-Options, HSTS, COOP)  << NEW
+[✓] Server-side rate limiting (register/login/report)
+
+----------------------------------------------------------------------
+ 10. REMAINING / BACKLOG (grouped by priority)
+----------------------------------------------------------------------
+HIGH
+[ ] Unread message counts + per-chat badge (retention driver)
+[ ] Message search within chat
+[ ] Group admin roles: promote/demote, remove member, leave group
+[ ] Group edit: rename / photo / description
+[ ] Delete for everyone
+[ ] Forward messages
+[ ] api/index.js (Vercel) parity with server routes + sockets (D1/D2 gap)
+
+MEDIUM
+[ ] Archive chats
+[ ] Read/unread toggle per chat
+[ ] Mute chats (with sound toggle)
+[ ] Edit messages
+[ ] Media gallery per chat
+[ ] Moderation dashboard for reported messages
+[ ] "Last seen 5 min ago" formatted timestamps
+[ ] PWA installable + offline cache
+[ ] Push sound + badge + deep-link to room
+
+ENGAGEMENT / GAMIFICATION (growth focus)
+[ ] Daily streaks & active-day calendar
+[ ] Achievements / badges (first message, group created, 7-day streak)
+[ ] Chat stats dashboard (messages sent, top chats, words)
+[ ] Status reactions / replies
+[ ] GIF / sticker packs
+[ ] Smart replies
+[ ] Voice rooms (live audio channels)
+[ ] Communities (multi-group spaces)
+
+================================================================================
+ NOTES
+===============================================================================
+- Statuses have no server-side 24h expiry job yet.
+- Real-time features require Socket.IO; Vercel serverless has no sockets.
+================================================================================
+ END OF FEATURE LIST
+================================================================================

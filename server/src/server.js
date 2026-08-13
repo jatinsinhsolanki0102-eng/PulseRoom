@@ -4,6 +4,7 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
@@ -11,12 +12,51 @@ import nodemailer from 'nodemailer';
 import { initDb, db } from './db.js';
 import { hashPassword, comparePassword, generateToken, generateConfirmationToken, verifyConfirmationToken, authenticateToken } from './auth.js';
 import { setupSocketHandlers, notifyRoomCreated } from './socketHandler.js';
+import { sendPushToRoom, vapidPublicKey } from './push.js';
+import { verifySignedIdentity } from './e2eeVerify.js';
 
 dotenv.config();
+
+// Simple in-memory rate limiter (per IP). Single-instance deployments are
+// fine; scale out to Redis when running many server instances.
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, name = 'rl' }) {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${name}:${ip}`;
+    const now = Date.now();
+    const bucket = rateBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateBuckets.set(key, bucket);
+    if (bucket.count > max) {
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) {
+    if (now > b.resetAt) rateBuckets.delete(k);
+  }
+}, 60000);
+
+async function isRoomMember(roomId, userId) {
+  const memberIds = await db.getRoomMemberIds(roomId);
+  return memberIds.includes(userId);
+}
 
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
+
+// Behind a reverse proxy (Railway / Render / Nginx / Vercel) trust the first
+// hop so req.ip reflects the real client for rate limiting.
+app.set('trust proxy', 1);
 
 // Universal Email Dispatcher Engine (Gmail SMTP Priority #1 for 100% Universal Delivery to ANY Email)
 async function sendEmail({ to, subject, htmlText, plainText }) {
@@ -90,14 +130,40 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
   };
 }
 
-// Setup CORS
+// Setup CORS - restricted to the configured frontend origin(s).
+// Set CLIENT_URL (comma-separated for multiple origins) in server/.env.
+// Same-origin requests (no Origin header) are always allowed.
+const allowedOrigins = (process.env.CLIENT_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+if (allowedOrigins.length === 0) {
+  console.warn('⚠️  CLIENT_URL is not set - CORS will allow all origins. Set CLIENT_URL in server/.env for production.');
+}
+const corsOrigin = allowedOrigins.length > 0
+  ? (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error('Origin not allowed by CORS'));
+    }
+  : true;
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || process.env.APP_URL || '*',
+  origin: corsOrigin,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 
 // Uploads directory setup
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
@@ -107,20 +173,27 @@ if (!fs.existsSync(uploadsDir)) {
 app.use('/uploads', express.static(uploadsDir));
 
 // Multer storage engine configuration
+// Files get unguessable UUID names so media URLs act as private share links
+// (WhatsApp-style: only members who received the URL can open it).
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
     const ext = path.extname(file.originalname) || (file.mimetype.includes('video') ? '.mp4' : file.mimetype.includes('audio') ? '.webm' : '.png');
-    cb(null, `${file.fieldname}-${uniqueSuffix}${ext}`);
+    cb(null, `${crypto.randomUUID()}${ext}`);
   }
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+
+const fileFilter = (req, file, cb) => {
+  if (/^(image|audio|video)\//.test(file.mimetype)) return cb(null, true);
+  return cb(new Error('Only image, audio and video files are allowed.'));
+};
+
+const upload = multer({ storage, fileFilter, limits: { fileSize: 50 * 1024 * 1024 } });
 
 // Initialize Socket.IO Server
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
     methods: ['GET', 'POST']
   }
 });
@@ -147,7 +220,7 @@ app.get('/', (req, res) => {
 });
 
 // 1. Auth: Sign Up (Email Confirmation Required Before Login)
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, name: 'register' }), async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body;
     if (!username || !email || !password) {
@@ -220,7 +293,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // 2. Auth: Resend Confirmation Email Route
-app.post('/api/auth/resend-confirmation', async (req, res) => {
+app.post('/api/auth/resend-confirmation', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, name: 'resend-confirm' }), async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email address is required.' });
@@ -322,7 +395,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
 });
 
 // 4. Auth: Login with Email & Password
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name: 'login' }), async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -358,7 +431,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // 5. Auth: Password Reset
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, name: 'forgot-pw' }), async (req, res) => {
   try {
     const { email, newPassword } = req.body;
     if (!email) {
@@ -426,11 +499,16 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete a user account by email (admin/maintenance helper)
+// Delete a user account - restricted to the authenticated user's OWN account
+// to prevent any logged-in user from deleting other accounts.
 app.delete('/api/users', authenticateToken, async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Email address is required.' });
+
+    if (email.trim().toLowerCase() !== (req.user.email || '').trim().toLowerCase()) {
+      return res.status(403).json({ error: 'You can only delete your own account.' });
+    }
 
     const removed = await db.deleteUserByEmail(email);
     if (!removed) return res.status(404).json({ error: 'No user found with that email address.' });
@@ -452,6 +530,115 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
   }
 });
 
+// 6b. Privacy: read/update last-seen visibility, profile photo & status visibility
+app.get('/api/users/privacy', authenticateToken, async (req, res) => {
+  try {
+    const prefs = await db.getPrivacyPrefs(req.user.id);
+    res.json(prefs || { last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch privacy preferences.' });
+  }
+});
+
+app.put('/api/users/privacy', authenticateToken, async (req, res) => {
+  try {
+    const { last_seen, profile_photo, status } = req.body;
+    const updated = await db.updatePrivacyPrefs(req.user.id, { last_seen, profile_photo, status });
+    io.emit('privacy_updated', updated);
+    res.json(updated);
+  } catch (err) {
+    console.error('Update Privacy Error:', err);
+    res.status(500).json({ error: 'Failed to update privacy preferences.' });
+  }
+});
+
+// 6c. Blocking: block, unblock and list blocked users
+app.post('/api/users/:userId/block', authenticateToken, async (req, res) => {
+  try {
+    const targetId = req.params.userId;
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot block yourself.' });
+    }
+    await db.blockUser(req.user.id, targetId);
+    io.emit('user_blocked', { blockerId: req.user.id, blockedId: targetId });
+    res.json({ message: 'User blocked.' });
+  } catch (err) {
+    console.error('Block User Error:', err);
+    res.status(500).json({ error: 'Failed to block user.' });
+  }
+});
+
+app.delete('/api/users/:userId/block', authenticateToken, async (req, res) => {
+  try {
+    await db.unblockUser(req.user.id, req.params.userId);
+    res.json({ message: 'User unblocked.' });
+  } catch (err) {
+    console.error('Unblock User Error:', err);
+    res.status(500).json({ error: 'Failed to unblock user.' });
+  }
+});
+
+app.get('/api/users/blocked', authenticateToken, async (req, res) => {
+  try {
+    const blockedIds = await db.getBlockedUserIds(req.user.id);
+    const blocked = [];
+    for (const id of blockedIds) {
+      const u = await db.findUserById(id);
+      if (u) blocked.push({ id: u.id, username: u.username, avatar_url: u.avatar_url, email: u.email });
+    }
+    res.json(blocked);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch blocked users.' });
+  }
+});
+
+// 6d. Web Push Notifications
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: vapidPublicKey });
+});
+
+app.post('/api/push/subscribe', authenticateToken, async (req, res) => {
+  try {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint || !subscription.keys?.p256dh || !subscription.keys?.auth) {
+      return res.status(400).json({ error: 'Valid push subscription is required.' });
+    }
+    await db.savePushSubscription({
+      userId: req.user.id,
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth
+    });
+    res.status(201).json({ message: 'Push subscription saved.' });
+  } catch (err) {
+    console.error('Push Subscribe Error:', err);
+    res.status(500).json({ error: 'Failed to save push subscription.' });
+  }
+});
+
+// 6e. Report a message (community moderation)
+app.post('/api/messages/:messageId/report', authenticateToken, rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'report' }), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || String(reason).length > 500) {
+      return res.status(400).json({ error: 'A reason (max 500 chars) is required.' });
+    }
+    const message = await db.getMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+
+    const report = await db.reportMessage({
+      messageId: req.params.messageId,
+      reporterId: req.user.id,
+      roomId: message.room_id,
+      reason
+    });
+    res.status(201).json(report);
+  } catch (err) {
+    console.error('Report Message Error:', err);
+    res.status(500).json({ error: 'Failed to submit report.' });
+  }
+});
+
 // 7. Rooms & Groups Routes
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
@@ -467,6 +654,9 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
     const { targetUserId } = req.body;
     if (!targetUserId) return res.status(400).json({ error: 'targetUserId is required.' });
     if (targetUserId === req.user.id) return res.status(400).json({ error: 'Cannot create direct chat with yourself.' });
+    if (await db.isBlockedBetween(req.user.id, targetUserId)) {
+      return res.status(403).json({ error: 'You cannot start a chat with this user.' });
+    }
 
     const room = await db.getOrCreatePrivateRoom(req.user.id, targetUserId);
     notifyRoomCreated(io, room, [req.user.id, targetUserId]);
@@ -519,8 +709,17 @@ app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
     if (!sourceRoomId || !targetRoomId) {
       return res.status(400).json({ error: 'sourceRoomId and targetRoomId are required.' });
     }
+    if (sourceRoomId === targetRoomId) {
+      return res.status(400).json({ error: 'Cannot bridge a room to itself.' });
+    }
 
-    const bridge = await db.createRoomBridge(sourceRoomId, targetRoomId, req.user.id);
+    const isSourceMember = await isRoomMember(sourceRoomId, req.user.id);
+    const isTargetMember = await isRoomMember(targetRoomId, req.user.id);
+    if (!isSourceMember || !isTargetMember) {
+      return res.status(403).json({ error: 'You must be a member of both rooms to bridge them.' });
+    }
+
+    const bridge = await db.createBridge(sourceRoomId, targetRoomId, req.user.id);
     io.emit('room_bridged', bridge);
     res.status(201).json(bridge);
   } catch (err) {
@@ -530,7 +729,7 @@ app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
 
 app.get('/api/rooms/bridges', authenticateToken, async (req, res) => {
   try {
-    const bridges = await db.getAllBridges();
+    const bridges = await db.getBridgesForUser(req.user.id);
     res.json(bridges);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch bridges.' });
@@ -540,6 +739,10 @@ app.get('/api/rooms/bridges', authenticateToken, async (req, res) => {
 // 9. Messages REST Routes
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
     const messages = await db.getRoomMessages(req.params.roomId, req.user.id);
     res.json(messages);
   } catch (err) {
@@ -549,8 +752,26 @@ app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
 
 app.post('/api/messages', authenticateToken, upload.single('media'), async (req, res) => {
   try {
-    const { roomId, text, type, replyToId } = req.body;
+    const { roomId, text, type, replyToId, e2ee, forwarded, forwardedFrom } = req.body;
     if (!roomId) return res.status(400).json({ error: 'roomId is required.' });
+    // E2EE envelopes carry base64 ciphertext + key material, so allow more room.
+    const maxLen = e2ee ? 30000 : 5000;
+    if (text && String(text).length > maxLen) {
+      return res.status(400).json({ error: `Message is too long (max ${maxLen} characters).` });
+    }
+
+    const isMember = await isRoomMember(roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    const memberIds = await db.getRoomMemberIds(roomId);
+    if (memberIds.length === 2) {
+      const otherId = memberIds.find(id => id !== req.user.id);
+      if (otherId && (await db.isBlockedBetween(req.user.id, otherId))) {
+        return res.status(403).json({ error: 'You cannot send messages to this user.' });
+      }
+    }
 
     let mediaUrl = undefined;
     if (req.file) {
@@ -565,10 +786,14 @@ app.post('/api/messages', authenticateToken, upload.single('media'), async (req,
       text,
       type: type || (mediaUrl ? (req.file?.mimetype.startsWith('video/') ? 'video' : 'image') : 'text'),
       mediaUrl,
-      replyToId
+      replyToId,
+      e2ee: Boolean(e2ee),
+      forwarded: Boolean(forwarded),
+      forwardedFrom: forwardedFrom || null
     });
 
     io.to(roomId).emit('new_message', message);
+    sendPushToRoom(io, roomId, { id: req.user.id, username: message.sender_name }, message);
     res.status(201).json(message);
   } catch (err) {
     console.error('Create Message Error:', err);
@@ -656,6 +881,10 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
 // 11. Toggle Pin Chat
 app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
     const isPinned = await db.togglePinChat(req.user.id, req.params.roomId);
     res.json({ is_pinned: isPinned });
   } catch (err) {
@@ -730,6 +959,284 @@ app.delete('/api/rooms/:roomId', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Delete Room Error:', err);
     res.status(500).json({ error: 'Failed to delete chat.' });
+  }
+});
+
+// 11d. WhatsApp-style "Disappearing messages": per-room auto-delete timer (0 = off)
+app.put('/api/rooms/:roomId/disappearing', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const { seconds } = req.body;
+    const memberIds = await db.getRoomMemberIds(roomId);
+    if (!memberIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const valid = [0, 24 * 3600, 7 * 24 * 3600, 90 * 24 * 3600];
+    if (!valid.includes(Number(seconds))) {
+      return res.status(400).json({ error: 'seconds must be 0, 86400, 604800 or 7776000.' });
+    }
+    await db.setRoomDisappearingTimer(roomId, Number(seconds));
+    const payload = { roomId, disappearing_seconds: Number(seconds), updatedBy: req.user.id };
+    io.to(roomId).emit('disappearing_timer_updated', payload);
+    res.json(payload);
+  } catch (err) {
+    console.error('Set Disappearing Timer Error:', err);
+    res.status(500).json({ error: 'Failed to update disappearing messages setting.' });
+  }
+});
+
+// 11e. End-to-End Encryption key exchange (public keys ONLY - private keys never leave the client)
+app.put('/api/e2ee/keys', authenticateToken, async (req, res) => {
+  try {
+    const { publicKey, signPublicKey, signature, signedPrekey } = req.body || {};
+    if (!publicKey || typeof publicKey !== 'string') {
+      return res.status(400).json({ error: 'publicKey is required.' });
+    }
+    // WhatsApp-style signed identity bundle: when a signing key + signature are
+    // supplied, verify they cryptographically bind this public key to the
+    // authenticated user before storing anything (tamper detection).
+    if (signPublicKey && signature) {
+      const valid = await verifySignedIdentity({
+        userId: req.user.id,
+        ecdhPub: publicKey,
+        signPub: signPublicKey,
+        signature
+      });
+      if (!valid) {
+        return res.status(400).json({ error: 'Invalid key signature. The identity key could not be verified.' });
+      }
+    }
+    const record = await db.setE2EEKey({
+      userId: req.user.id,
+      publicKey,
+      signedPrekey: signedPrekey || '',
+      signPublicKey: signPublicKey || '',
+      signature: signature || ''
+    });
+    res.json(record);
+  } catch (err) {
+    console.error('Save E2EE Key Error:', err);
+    res.status(500).json({ error: 'Failed to store encryption key.' });
+  }
+});
+
+app.get('/api/e2ee/keys/:userId', authenticateToken, async (req, res) => {
+  try {
+    const key = await db.getE2EEKey(req.params.userId);
+    if (!key) return res.status(404).json({ error: 'No encryption key found for this user yet.' });
+    res.json(key);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch encryption key.' });
+  }
+});
+
+// 11f. Message search within a chat
+app.get('/api/rooms/:roomId/search', authenticateToken, async (req, res) => {
+  try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const query = req.query.q || '';
+    if (!query.trim()) return res.json([]);
+    const results = await db.searchRoomMessages(req.params.roomId, req.user.id, query);
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to search messages.' });
+  }
+});
+
+// 11g. Group admin roles: promote / demote member (admin only)
+app.put('/api/rooms/:roomId/members/:userId/role', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, userId: targetId } = req.params;
+    const { role } = req.body;
+
+    if (role !== 'admin' && role !== 'member') {
+      return res.status(400).json({ error: 'role must be "admin" or "member".' });
+    }
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot change your own role.' });
+    }
+
+    const myRole = await db.getRoomMemberRole(roomId, req.user.id);
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can manage roles.' });
+    }
+
+    const targetRole = await db.getRoomMemberRole(roomId, targetId);
+    if (!targetRole) return res.status(404).json({ error: 'Member not found in this group.' });
+
+    const updated = await db.setRoomMemberRole(roomId, targetId, role);
+    io.to(roomId).emit('group_role_updated', { roomId, userId: targetId, role, updatedBy: req.user.id });
+    io.emit('room_members_updated', { id: roomId });
+    res.json(updated);
+  } catch (err) {
+    console.error('Update Group Role Error:', err);
+    res.status(500).json({ error: 'Failed to update member role.' });
+  }
+});
+
+// 11h. Remove a member from a group (admin only)
+app.delete('/api/rooms/:roomId/members/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, userId: targetId } = req.params;
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'Use "Leave group" to exit the group yourself.' });
+    }
+
+    const myRole = await db.getRoomMemberRole(roomId, req.user.id);
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can remove members.' });
+    }
+
+    const removed = await db.removeRoomMember(roomId, targetId);
+    if (!removed) return res.status(404).json({ error: 'Member not found in this group.' });
+
+    const payload = { roomId, removedUserId: targetId, removedBy: req.user.id };
+    io.to(`user:${targetId}`).emit('removed_from_room', payload);
+    io.emit('room_members_updated', { id: roomId });
+    res.json({ message: 'Member removed from the group.', payload });
+  } catch (err) {
+    console.error('Remove Group Member Error:', err);
+    res.status(500).json({ error: 'Failed to remove member.' });
+  }
+});
+
+// 11i. Leave a group (any member)
+app.post('/api/rooms/:roomId/leave', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const myRole = await db.getRoomMemberRole(roomId, req.user.id);
+    if (!myRole) return res.status(404).json({ error: 'You are not a member of this group.' });
+
+    await db.removeRoomMember(roomId, req.user.id);
+    const remaining = await db.getRoomMemberIds(roomId);
+
+    // If the group is now empty, dissolve it.
+    if (remaining.length === 0) {
+      await db.deleteGroupRoom(roomId);
+      io.emit('room_deleted', { roomId });
+    } else {
+      // Promote a remaining member to admin if the leaver was the only admin.
+      const admins = [];
+      for (const memberId of remaining) {
+        if ((await db.getRoomMemberRole(roomId, memberId)) === 'admin') admins.push(memberId);
+      }
+      if (admins.length === 0) {
+        await db.setRoomMemberRole(roomId, remaining[0], 'admin');
+      }
+    }
+
+    const payload = { roomId, userId: req.user.id };
+    io.to(`user:${req.user.id}`).emit('left_room', payload);
+    io.emit('room_members_updated', { id: roomId });
+    res.json({ message: 'You left the group.', payload });
+  } catch (err) {
+    console.error('Leave Group Error:', err);
+    res.status(500).json({ error: 'Failed to leave group.' });
+  }
+});
+
+// 11j. Group edit: rename / photo / description (admin only)
+app.put('/api/rooms/:roomId', authenticateToken, upload.single('avatar'), async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const myRole = await db.getRoomMemberRole(roomId, req.user.id);
+    if (!myRole) return res.status(404).json({ error: 'You are not a member of this room.' });
+
+    const isGroup = (await db.getRoomMemberIds(roomId)).length > 2 || myRole === 'admin';
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can edit group details.' });
+    }
+
+    let avatarUrl = undefined;
+    if (req.file) avatarUrl = `/uploads/${req.file.filename}`;
+    else if (req.body.avatarUrl) avatarUrl = req.body.avatarUrl;
+
+    const updated = await db.updateRoom(roomId, {
+      name: req.body.name,
+      description: req.body.description,
+      avatarUrl,
+      themeColor: req.body.themeColor
+    });
+    if (!updated) return res.status(404).json({ error: 'Room not found.' });
+
+    io.to(roomId).emit('room_updated', updated);
+    io.emit('room_members_updated', { id: roomId });
+    res.json(updated);
+  } catch (err) {
+    console.error('Update Room Error:', err);
+    res.status(500).json({ error: 'Failed to update group details.' });
+  }
+});
+
+// 11k. Delete for everyone (sender only)
+app.post('/api/messages/:messageId/delete-everyone', authenticateToken, async (req, res) => {
+  try {
+    const message = await db.getMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+    if (String(message.sender_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'You can only delete messages you sent.' });
+    }
+
+    const result = await db.deleteMessageForEveryone(req.params.messageId, req.user.id);
+    if (!result) return res.status(404).json({ error: 'Message not found.' });
+
+    const payload = { messageId: req.params.messageId, roomId: result.room_id };
+    io.to(result.room_id).emit('message_deleted_everyone', payload);
+    res.json({ message: 'Message deleted for everyone.', payload });
+  } catch (err) {
+    console.error('Delete for Everyone Error:', err);
+    res.status(500).json({ error: 'Failed to delete message for everyone.' });
+  }
+});
+
+// 11l. Forward a message to one or more rooms (client re-encrypts when E2EE is on)
+app.post('/api/messages/forward', authenticateToken, async (req, res) => {
+  try {
+    const { targetRoomIds, text, type, mediaUrl, originalMessageId, e2ee } = req.body;
+    if (!Array.isArray(targetRoomIds) || targetRoomIds.length === 0) {
+      return res.status(400).json({ error: 'targetRoomIds must be a non-empty array.' });
+    }
+
+    const created = [];
+    for (const targetRoomId of targetRoomIds) {
+      const isMember = await isRoomMember(targetRoomId, req.user.id);
+      if (!isMember) continue;
+
+      // Blocked enforcement for 1:1 targets
+      const memberIds = await db.getRoomMemberIds(targetRoomId);
+      if (memberIds.length === 2) {
+        const otherId = memberIds.find(id => id !== req.user.id);
+        if (otherId && (await db.isBlockedBetween(req.user.id, otherId))) continue;
+      }
+
+      const msg = await db.forwardMessage({
+        roomId: targetRoomId,
+        senderId: req.user.id,
+        text,
+        type: type || 'text',
+        mediaUrl: mediaUrl || '',
+        originalMessageId: originalMessageId || null,
+        e2ee: Boolean(e2ee)
+      });
+      created.push(msg);
+
+      io.to(targetRoomId).emit('new_message', msg);
+      for (const memberId of memberIds) {
+        io.to(`user:${memberId}`).emit('new_message', msg);
+      }
+      sendPushToRoom(io, targetRoomId, { id: req.user.id, username: msg.sender_name }, msg);
+    }
+
+    if (created.length === 0) {
+      return res.status(403).json({ error: 'Could not forward to any of the selected chats.' });
+    }
+    res.status(201).json({ messages: created });
+  } catch (err) {
+    console.error('Forward Message Error:', err);
+    res.status(500).json({ error: 'Failed to forward message.' });
   }
 });
 
@@ -832,6 +1339,18 @@ initDb().then(() => {
       process.exit(1);
     }
   });
+
+  // Disappearing messages cleanup job - runs every 30 seconds
+  setInterval(async () => {
+    try {
+      const result = await db.cleanupExpiredDisappearingMessages();
+      for (const item of result) {
+        io.to(item.roomId).emit('messages_expired', { roomId: item.roomId, messageIds: item.messageIds });
+      }
+    } catch (e) {
+      console.error('Disappearing messages cleanup error:', e.message);
+    }
+  }, 30 * 1000);
 
   server.listen(PORT, () => {
     console.log(`🚀 PulseRoom Server listening on http://localhost:${PORT}`);

@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useSocket } from '../../context/SocketContext';
+import { useE2EE } from '../../context/E2EEContext';
 import StatusTray from '../status/StatusTray';
 import ProfileModal from '../profile/ProfileModal';
 import { MessageSquare, Users, GitMerge, Search, Plus, Palette, LogOut, UserCheck, Pin, UserPlus, Layers, Camera, Settings } from 'lucide-react';
@@ -8,13 +9,16 @@ import { MessageSquare, Users, GitMerge, Search, Plus, Palette, LogOut, UserChec
 export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, onOpenBridgeModal, onOpenThemeStudio, onOpenCreateStatus, onOpenInviteModal }) {
   const { user, token, logout } = useAuth();
   const { socket, onlineUsers } = useSocket();
-  
+  const { ready: e2eeReady, decryptMessage } = useE2EE();
+
   const [activeTab, setActiveTab] = useState('all'); // 'all' | 'chats' | 'groups' | 'directory'
   const [searchQuery, setSearchQuery] = useState('');
   const [rooms, setRooms] = useState([]);
   const [allUsers, setAllUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [lastPreviews, setLastPreviews] = useState({});
+  const decryptedIdsRef = useRef(new Set());
 
   useEffect(() => {
     if (token) {
@@ -36,6 +40,8 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
     socket.on('room_deleted_for_me', handleRealTimeRoomUpdate);
     socket.on('room_cleared', handleRealTimeRoomUpdate);
     socket.on('room_members_updated', handleRealTimeRoomUpdate);
+    socket.on('user_blocked', handleRealTimeRoomUpdate);
+    socket.on('disappearing_timer_updated', handleRealTimeRoomUpdate);
 
     return () => {
       socket.off('room_created', handleRealTimeRoomUpdate);
@@ -44,6 +50,8 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
       socket.off('room_deleted_for_me', handleRealTimeRoomUpdate);
       socket.off('room_cleared', handleRealTimeRoomUpdate);
       socket.off('room_members_updated', handleRealTimeRoomUpdate);
+      socket.off('user_blocked', handleRealTimeRoomUpdate);
+      socket.off('disappearing_timer_updated', handleRealTimeRoomUpdate);
     };
   }, [socket]);
 
@@ -87,6 +95,30 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
       setAllUsers([]);
     }
   };
+
+  // Decrypt e2ee last-message previews so raw ciphertext (which leaks sender
+  // public keys / ids) is never rendered in the chat list.
+  useEffect(() => {
+    if (!e2eeReady || !token) return;
+    let cancelled = false;
+    const work = async () => {
+      const updates = {};
+      for (const room of Array.isArray(rooms) ? rooms : []) {
+        const lm = room.last_message;
+        if (!lm || !lm.e2ee) continue;
+        if (decryptedIdsRef.current.has(lm.id)) continue;
+        const dec = await decryptMessage(lm, room.id);
+        if (cancelled) return;
+        decryptedIdsRef.current.add(lm.id);
+        updates[lm.id] = { text: dec?.decryptedText || '', type: dec?.decryptedType || lm.type };
+      }
+      if (Object.keys(updates).length > 0) {
+        setLastPreviews(prev => ({ ...prev, ...updates }));
+      }
+    };
+    work();
+    return () => { cancelled = true; };
+  }, [rooms, token, e2eeReady, decryptMessage]);
 
   const startPrivateChat = async (targetUser) => {
     if (!targetUser?.id) return;
@@ -240,8 +272,15 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
               const isPrivate = room.type === 'private';
               const name = isPrivate ? room.partner?.username || 'Private Chat' : room.name || 'Group Room';
               const avatar = isPrivate ? room.partner?.avatar_url : room.avatar_url;
-              const isOnline = isPrivate && (onlineUsers.has(room.partner?.id) || room.partner?.status === 'online');
-              const lastMsgText = room.last_message?.text || 'No messages yet';
+              const isOnline = isPrivate && onlineUsers.has(room.partner?.id);
+              const lm = room.last_message;
+              const preview = lm ? lastPreviews[lm.id] : null;
+              const isEncrypted = Boolean(lm?.e2ee);
+              const lastMsgText = !lm
+                ? 'No messages yet'
+                : isEncrypted
+                  ? (preview?.text ? (preview.type !== 'text' && preview.type !== 'e2ee' ? `📎 ${preview.type}` : preview.text) : '🔒 Encrypted message')
+                  : (lm.text || 'No messages yet');
 
               return (
                 <div
@@ -271,7 +310,7 @@ export default function Sidebar({ activeRoom, onSelectRoom, onOpenGroupModal, on
           )
         ) : (
           filteredUsers.map(u => {
-            const isOnline = onlineUsers.has(u.id) || u.status === 'online';
+            const isOnline = onlineUsers.has(u.id);
             return (
               <div
                 key={u.id}

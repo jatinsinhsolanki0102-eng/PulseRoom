@@ -1,6 +1,7 @@
-import React, { useState, useEffect, Component } from 'react';
+import React, { useState, useEffect, useRef, Component } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { SocketProvider, useSocket } from './context/SocketContext';
+import { E2EEProvider, useE2EE } from './context/E2EEContext';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 
 import AuthModal from './components/auth/AuthModal';
@@ -77,14 +78,32 @@ class ErrorBoundary extends Component {
   }
 }
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
 function ChatAppContent() {
   const { user, token } = useAuth();
-  const { socket, typingState, joinRoom } = useSocket();
+  const { socket, typingState, joinRoom, markRead } = useSocket();
   const { theme } = useTheme();
+  const { ready: e2eeReady, decryptMessage, decryptMessages } = useE2EE();
 
   const [activeRoom, setActiveRoom] = useState(null);
   const [messages, setMessages] = useState([]);
   const [replyTo, setReplyTo] = useState(null);
+
+  const decryptingRef = useRef(new Set());
+  // Permanently tracks message ids already received live so a duplicate delivery
+  // (e.g. server retransmit) is dropped BEFORE decryption - this prevents the
+  // replay counter from flagging a legitimate message as "replayed or duplicate".
+  const processedIdsRef = useRef(new Set());
 
   // Modals & Panels state
   const [showGroupModal, setShowGroupModal] = useState(false);
@@ -105,6 +124,7 @@ function ChatAppContent() {
     if (activeRoom && token) {
       joinRoom(activeRoom.id);
       fetchRoomMessages(activeRoom.id);
+      markRead(activeRoom.id);
     }
   }, [activeRoom, token]);
 
@@ -112,13 +132,21 @@ function ChatAppContent() {
     if (!socket) return;
 
     const handleNewMessage = (msg) => {
-      if (msg && msg.room_id === activeRoom?.id) {
-        setMessages(prev => {
-          const safePrev = Array.isArray(prev) ? prev : [];
-          if (safePrev.some(m => m.id === msg.id)) return safePrev;
-          return [...safePrev, msg];
+      if (!msg || msg.room_id !== activeRoom?.id) return;
+      if (processedIdsRef.current.has(msg.id)) return;
+      processedIdsRef.current.add(msg.id);
+      if (decryptingRef.current.has(msg.id)) return;
+      decryptingRef.current.add(msg.id);
+      // Decrypt in place so the bubble can render the plaintext immediately.
+      decryptMessage(msg, activeRoom.id).then(decrypted => {
+        decryptingRef.current.delete(msg.id);
+        setMessages(cur => {
+          const safeCur = Array.isArray(cur) ? cur : [];
+          if (safeCur.some(m => m.id === msg.id)) return safeCur;
+          return [...safeCur, decrypted];
         });
-      }
+      }).catch(() => decryptingRef.current.delete(msg.id));
+      markRead(activeRoom.id); // auto-mark incoming messages as read
     };
 
     const handleReactionUpdated = ({ messageId, reactions }) => {
@@ -126,6 +154,49 @@ function ChatAppContent() {
         const safePrev = Array.isArray(prev) ? prev : [];
         return safePrev.map(m => (m.id === messageId ? { ...m, reactions } : m));
       });
+    };
+
+    const handleReadReceipt = ({ roomId, userId, timestamp, messageIds }) => {
+      if (roomId !== activeRoom?.id || !Array.isArray(messageIds)) return;
+      const ids = new Set(messageIds);
+      setMessages(prev => {
+        const safePrev = Array.isArray(prev) ? prev : [];
+        return safePrev.map(m => {
+          if (!ids.has(m.id)) return m;
+          const readBy = new Set(m.read_by || []);
+          readBy.add(userId);
+          return {
+            ...m,
+            read_by: Array.from(readBy),
+            read_timestamps: { ...(m.read_timestamps || {}), [userId]: timestamp }
+          };
+        });
+      });
+    };
+
+    const handleMessagesExpired = ({ roomId, messageIds }) => {
+      if (roomId !== activeRoom?.id || !Array.isArray(messageIds)) return;
+      const ids = new Set(messageIds);
+      setMessages(prev => {
+        const safePrev = Array.isArray(prev) ? prev : [];
+        return safePrev.filter(m => !ids.has(m.id));
+      });
+    };
+
+    const handleDisappearingTimerUpdated = ({ roomId, disappearing_seconds }) => {
+      if (roomId === activeRoom?.id) {
+        setActiveRoom(prev => prev ? { ...prev, disappearing_seconds } : prev);
+      }
+    };
+
+    const handleUserBlocked = ({ blockerId, blockedId }) => {
+      if (blockerId === user?.id || blockedId === user?.id) {
+        const partnerId = activeRoom?.type === 'private' ? activeRoom.partner?.id : null;
+        if (partnerId && (partnerId === blockerId || partnerId === blockedId)) {
+          setActiveRoom(null);
+          setMessages([]);
+        }
+      }
     };
 
     const handleMessageDeletedForMe = ({ messageId, userId }) => {
@@ -157,16 +228,32 @@ function ChatAppContent() {
       }
     };
 
+    // If the socket was still connecting when the room was opened, mark_read was
+    // skipped - re-mark on connect so read receipts reach the other user.
+    const handleSocketConnected = () => {
+      if (activeRoom?.id && token) markRead(activeRoom.id);
+    };
+
+    socket.on('connect', handleSocketConnected);
     socket.on('new_message', handleNewMessage);
     socket.on('reaction_updated', handleReactionUpdated);
+    socket.on('read_receipt', handleReadReceipt);
+    socket.on('messages_expired', handleMessagesExpired);
+    socket.on('disappearing_timer_updated', handleDisappearingTimerUpdated);
+    socket.on('user_blocked', handleUserBlocked);
     socket.on('message_deleted_for_me', handleMessageDeletedForMe);
     socket.on('room_deleted_for_me', handleRoomDeletedForMe);
     socket.on('room_cleared', handleRoomCleared);
     socket.on('room_members_updated', handleRoomMembersUpdated);
 
     return () => {
+      socket.off('connect', handleSocketConnected);
       socket.off('new_message', handleNewMessage);
       socket.off('reaction_updated', handleReactionUpdated);
+      socket.off('read_receipt', handleReadReceipt);
+      socket.off('messages_expired', handleMessagesExpired);
+      socket.off('disappearing_timer_updated', handleDisappearingTimerUpdated);
+      socket.off('user_blocked', handleUserBlocked);
       socket.off('message_deleted_for_me', handleMessageDeletedForMe);
       socket.off('room_deleted_for_me', handleRoomDeletedForMe);
       socket.off('room_cleared', handleRoomCleared);
@@ -181,7 +268,25 @@ function ChatAppContent() {
       });
       if (res.ok) {
         const data = await res.json();
-        setMessages(Array.isArray(data) ? data : []);
+        const decrypted = await decryptMessages(Array.isArray(data) ? data : [], roomId);
+        // Merge with the current list by id: keep an already-decrypted good copy
+        // instead of replacing it with a re-decrypted one. Re-decrypting messages
+        // that were already seen live trips the replay counter on the latest one
+        // (e.g. during the e2ee-ready refetch) and would show false replays.
+        setMessages(prev => {
+          const prevArr = Array.isArray(prev) ? prev : [];
+          const prevById = new Map(prevArr.map(m => [m.id, m]));
+          const out = [];
+          for (const m of decrypted) {
+            const existing = prevById.get(m.id);
+            if (existing && !existing.__replay && !existing.__undecryptable) {
+              out.push(existing);
+            } else {
+              out.push(m);
+            }
+          }
+          return out;
+        });
       } else {
         setMessages([]);
       }
@@ -190,6 +295,15 @@ function ChatAppContent() {
       setMessages([]);
     }
   };
+
+  // Once E2EE keys are ready, re-fetch so messages that arrived while the key
+  // was still being generated get decrypted properly.
+  useEffect(() => {
+    if (e2eeReady && activeRoom?.id) {
+      fetchRoomMessages(activeRoom.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [e2eeReady]);
 
   const handleDeleteMessage = async (messageId) => {
     try {
@@ -257,6 +371,70 @@ function ChatAppContent() {
     setShowChatInfo(false);
   };
 
+  const handleReportMessage = async (messageId, reason) => {
+    try {
+      const res = await fetch(`/api/messages/${messageId}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ reason })
+      });
+      return res.ok;
+    } catch (err) {
+      console.error('Failed to report message:', err);
+      return false;
+    }
+  };
+
+  const handleBlockUser = async () => {
+    const partnerId = activeRoom?.type === 'private' ? activeRoom.partner?.id : null;
+    if (!partnerId) return;
+    try {
+      await fetch(`/api/users/${partnerId}/block`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setActiveRoom(null);
+      setMessages([]);
+    } catch (err) {
+      console.error('Failed to block user:', err);
+    }
+  };
+
+  // Web Push notification registration + subscription
+  useEffect(() => {
+    if (!user || !token) return;
+    let cancelled = false;
+    const enablePush = async () => {
+      try {
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+        const reg = await navigator.serviceWorker.register('/sw.js');
+        if (Notification.permission === 'denied') return;
+        if (Notification.permission === 'default') {
+          Notification.requestPermission().catch(() => {});
+        }
+        const vapidRes = await fetch('/api/push/vapid-public-key');
+        if (!vapidRes.ok) return;
+        const { publicKey } = await vapidRes.json();
+        if (!publicKey) return;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {
+          const applicationServerKey = urlBase64ToUint8Array(publicKey);
+          sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey });
+        }
+        if (cancelled) return;
+        await fetch('/api/push/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ subscription: sub.toJSON() })
+        });
+      } catch (err) {
+        console.warn('Push notification setup skipped:', err.message);
+      }
+    };
+    enablePush();
+    return () => { cancelled = true; };
+  }, [user, token]);
+
   if (!user) {
     return <AuthModal />;
   }
@@ -293,9 +471,11 @@ function ChatAppContent() {
               typingUser={typingUser}
               onReply={setReplyTo}
               onDeleteMessage={handleDeleteMessage}
+              onReportMessage={handleReportMessage}
             />
 
             <ChatComposer
+              room={activeRoom}
               roomId={activeRoom.id}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
@@ -329,6 +509,7 @@ function ChatAppContent() {
           onDeleteChat={handleDeleteChat}
           onClearChat={handleClearChat}
           onMembersAdded={handleMembersAdded}
+          onBlockUser={handleBlockUser}
         />
       )}
 
@@ -373,9 +554,11 @@ export default function App() {
     <ErrorBoundary>
       <AuthProvider>
         <SocketProvider>
-          <ThemeProvider>
-            <ChatAppContent />
-          </ThemeProvider>
+          <E2EEProvider>
+            <ThemeProvider>
+              <ChatAppContent />
+            </ThemeProvider>
+          </E2EEProvider>
         </SocketProvider>
       </AuthProvider>
     </ErrorBoundary>

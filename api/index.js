@@ -23,7 +23,11 @@ const _instanceJwtSecret = process.env.JWT_SECRET || (() => {
     fs.writeFileSync(_secretFile, secret);
     return secret;
   } catch (e) {
-    return 'pr_det_' + crypto.createHash('sha256').update('pulseroom-stable-session-key').digest('hex').slice(0, 32);
+    // No hardcoded fallback - a predictable secret lets anyone forge tokens.
+    if (process.env.NODE_ENV === 'production') {
+      console.error('JWT_SECRET is not set. Set it in the Vercel dashboard so sessions survive cold starts.');
+    }
+    return 'pr_' + crypto.randomBytes(32).toString('hex');
   }
 })();
 const getJwtSecret = () => _instanceJwtSecret;
@@ -38,6 +42,7 @@ const globalRooms = global._pulseroom_rooms || new Map();
 const globalMessages = global._pulseroom_messages || new Map();
 const globalStatuses = global._pulseroom_statuses || new Map();
 const globalPendingInvites = global._pulseroom_pending_invites || new Map();
+const globalE2EEKeys = global._pulseroom_e2ee_keys || new Map();
 
 global._pulseroom_users = globalUsers;
 global._pulseroom_confirmed = globalConfirmedEmails;
@@ -46,6 +51,7 @@ global._pulseroom_rooms = globalRooms;
 global._pulseroom_messages = globalMessages;
 global._pulseroom_statuses = globalStatuses;
 global._pulseroom_pending_invites = globalPendingInvites;
+global._pulseroom_e2ee_keys = globalE2EEKeys;
 
 function getSupabaseHeaders() {
   const key = getSupabaseAnonKey();
@@ -58,12 +64,13 @@ function getSupabaseHeaders() {
 }
 
 // Self-Contained Signed Token Helpers
-function generateConfirmationToken(email, username, passwordHash) {
+// NOTE: never embed password hashes in the confirmation token - it is sent
+// inside an email link. Identity is resolved from the signed payload + lookup.
+function generateConfirmationToken(email, username) {
   return jwt.sign(
     {
       email: email.trim().toLowerCase(),
       username: username ? username.trim() : email.split('@')[0],
-      passwordHash,
       purpose: 'confirm_email'
     },
     getJwtSecret(),
@@ -299,8 +306,51 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
 
 // Express App
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
-app.use(express.json());
+app.set('trust proxy', 1);
+
+// Simple in-memory rate limiter (per IP)
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, name = 'rl' }) {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${name}:${ip}`;
+    const now = Date.now();
+    const bucket = rateBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateBuckets.set(key, bucket);
+    if (bucket.count > max) {
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) {
+    if (now > b.resetAt) rateBuckets.delete(k);
+  }
+}, 60000);
+
+// CORS - restrict to the configured frontend origin(s)
+const allowedOrigins = (process.env.CLIENT_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+if (allowedOrigins.length === 0) {
+  console.warn('⚠️  CLIENT_URL is not set - CORS will allow all origins. Set CLIENT_URL in the Vercel dashboard for production.');
+}
+app.use(cors({
+  origin: allowedOrigins.length > 0
+    ? (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error('Origin not allowed by CORS'));
+      }
+    : true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '100kb' }));
 
 // In-memory upload buffer (serverless deployments cannot persist files to disk)
 const upload = multer({
@@ -331,7 +381,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // 1. Sign Up Endpoint (Preserves Username)
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, name: 'register' }), async (req, res) => {
   try {
     const { username, email, password, avatarUrl, bio } = req.body || {};
     if (!username || !email || !password) {
@@ -357,7 +407,7 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     const hostUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-    const confirmToken = generateConfirmationToken(cleanEmail, username.trim(), passwordHash);
+    const confirmToken = generateConfirmationToken(cleanEmail, username.trim());
     const confirmLink = `${hostUrl}/api/auth/confirm-email?token=${confirmToken}&email=${encodeURIComponent(cleanEmail)}`;
 
     const htmlText = `
@@ -405,7 +455,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // 2. Resend Confirmation Email Endpoint
-app.post('/api/auth/resend-confirmation', async (req, res) => {
+app.post('/api/auth/resend-confirmation', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, name: 'resend-confirm' }), async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Email address is required.' });
@@ -418,7 +468,7 @@ app.post('/api/auth/resend-confirmation', async (req, res) => {
     }
 
     const hostUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-    const confirmToken = generateConfirmationToken(cleanEmail, user.username, user.password_hash);
+    const confirmToken = generateConfirmationToken(cleanEmail, user.username);
     const confirmLink = `${hostUrl}/api/auth/confirm-email?token=${confirmToken}&email=${encodeURIComponent(cleanEmail)}`;
 
     const htmlText = `
@@ -464,16 +514,12 @@ app.get('/api/auth/confirm-email', async (req, res) => {
       return res.status(400).send('Invalid or expired confirmation link.');
     }
 
-    const { username, passwordHash } = verification.payload || {};
-    
-    await createUser({
-      username: username || cleanEmail.split('@')[0],
-      email: cleanEmail,
-      passwordHash: passwordHash || '$2a$10$defaultDummyHashForVerifiedEmailOnly',
-      emailConfirmed: true
-    });
+    const { username } = verification.payload || {};
 
+    // The account already exists from register; just mark it confirmed.
+    // Never re-create with a dummy password hash.
     await markEmailConfirmed(cleanEmail);
+    await findUserByEmail(cleanEmail);
 
     // Auto-connect pending friend invitations so the inviter's chat room opens automatically
     const confirmedUser = await findUserByEmail(cleanEmail);
@@ -512,7 +558,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
 });
 
 // 4. Login Endpoint (Preserves Username - NEVER auto-creates accounts)
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name: 'login' }), async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {
@@ -553,7 +599,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // 5. Password Reset
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', rateLimit({ windowMs: 60 * 60 * 1000, max: 5, name: 'forgot-pw' }), async (req, res) => {
   try {
     const { email, newPassword } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Email address is required.' });
@@ -801,6 +847,11 @@ app.delete('/api/rooms/:roomId', authenticateToken, async (req, res) => {
 // 8. Messages REST Endpoints
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+    if (!room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
     const msgs = (globalMessages.get(req.params.roomId) || [])
       .filter(m => !(m.deleted_for || []).includes(req.user.id));
     return res.json(msgs);
@@ -811,8 +862,19 @@ app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
 
 app.post('/api/messages', authenticateToken, async (req, res) => {
   try {
-    const { roomId, text, type, mediaUrl, replyToId } = req.body || {};
+    const { roomId, text, type, mediaUrl, replyToId, e2ee } = req.body || {};
     if (!roomId) return res.status(400).json({ error: 'roomId is required.' });
+    // E2EE envelopes carry base64 ciphertext + key material, so allow more room.
+    const maxLen = e2ee ? 30000 : 5000;
+    if (text && String(text).length > maxLen) {
+      return res.status(400).json({ error: `Message is too long (max ${maxLen} characters).` });
+    }
+
+    const room = globalRooms.get(roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+    if (!room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
 
     const user = await findUserById(req.user.id);
     const msgId = 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(7);
@@ -829,6 +891,7 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
       type: type || 'text',
       media_url: mediaUrl,
       reply_to_id: replyToId,
+      e2ee: Boolean(e2ee),
       deleted_for: [],
       created_at: new Date().toISOString()
     };
@@ -841,6 +904,41 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
     return res.status(201).json(message);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to send message.' });
+  }
+});
+
+// WhatsApp-style end-to-end encryption key exchange (public keys ONLY - private
+// keys never leave the client; the server only relays ciphertext it cannot read).
+// Signed identity bundles: clients upload the ECDH identity public key plus an
+// ECDSA signature binding it to their userId. Recipients verify this signature
+// before trusting any message, so swapped/tampered keys are detected.
+app.put('/api/e2ee/keys', authenticateToken, async (req, res) => {
+  try {
+    const { publicKey, signPublicKey, signature, signedPrekey } = req.body || {};
+    if (!publicKey || typeof publicKey !== 'string') {
+      return res.status(400).json({ error: 'publicKey is required.' });
+    }
+    const record = {
+      user_id: req.user.id,
+      public_key: publicKey,
+      signed_prekey: signedPrekey || '',
+      sign_public_key: signPublicKey || '',
+      signature: signature || ''
+    };
+    globalE2EEKeys.set(req.user.id, record);
+    return res.json(record);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to store encryption key.' });
+  }
+});
+
+app.get('/api/e2ee/keys/:userId', authenticateToken, async (req, res) => {
+  try {
+    const key = globalE2EEKeys.get(req.params.userId);
+    if (!key) return res.status(404).json({ error: 'No encryption key found for this user yet.' });
+    return res.json(key);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch encryption key.' });
   }
 });
 

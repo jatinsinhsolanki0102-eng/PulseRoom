@@ -1,6 +1,6 @@
 import React from 'react';
 import { useSocket } from '../../context/SocketContext';
-import { Info, ArrowLeft } from 'lucide-react';
+import { Info, ArrowLeft, Lock } from 'lucide-react';
 
 export default function ChatHeader({ room, onToggleInfo, onBack }) {
   const { onlineUsers } = useSocket();
@@ -10,7 +10,7 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
   const isPrivate = room.type === 'private';
   const name = isPrivate ? room.partner?.username || 'Private Chat' : room.name;
   const avatar = isPrivate ? room.partner?.avatar_url : room.avatar_url;
-  const isOnline = isPrivate && (onlineUsers.has(room.partner?.id) || room.partner?.status === 'online');
+  const isOnline = isPrivate && onlineUsers.has(room.partner?.id);
 
   return (
     <div className="chat-header">
@@ -33,7 +33,14 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
           </div>
 
           <div>
-            <div className="chat-header-name">{name}</div>
+            <div className="chat-header-name">
+              {name}
+              <Lock
+                size={13}
+                style={{ color: 'var(--primary-accent)', verticalAlign: '1px', marginLeft: '6px', cursor: 'default' }}
+                title="Messages are end-to-end encrypted"
+              />
+            </div>
             <div className="chat-header-status">
               {isPrivate ? (
                 isOnline ? (
