@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
+import dns from 'node:dns';
 
 import { initDb, db } from './db.js';
 import { hashPassword, comparePassword, generateToken, generateConfirmationToken, verifyConfirmationToken, authenticateToken } from './auth.js';
@@ -58,6 +59,16 @@ const PORT = process.env.PORT || 5000;
 // hop so req.ip reflects the real client for rate limiting.
 app.set('trust proxy', 1);
 
+// Force IPv4-first DNS resolution. smtp.gmail.com (and other dual-stack hosts)
+// resolve to IPv6 first, and hosts without an IPv6 route (Render free tier)
+// hit ENETUNREACH / blackhole timeouts. Same fix already applied for Postgres.
+dns.setDefaultResultOrder('ipv4first');
+
+// Last email error (for diagnostics - /api/health, /api/email/diag, register).
+// Set on every failed attempt so the UI and ops can see the real reason
+// (wrong app password, IP blocked by Gmail, TLS error, timeout, etc).
+let lastEmailError = '';
+
 // Universal Email Dispatcher Engine (Gmail SMTP Priority #1 for 100% Universal Delivery to ANY Email)
 async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   dotenv.config({ override: true });
@@ -70,7 +81,8 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
 
   // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Worldwide)
   // Try explicit-TLS port 465 first, then STARTTLS port 587 (some hosting
-  // networks only allow one of them).
+  // networks only allow one of them). Generous timeouts: cloud egress paths
+  // (Render free tier) can be slow to reach smtp.gmail.com.
   if (gmailUser && gmailPass) {
     console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
     for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
@@ -79,10 +91,11 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
           host: 'smtp.gmail.com',
           port,
           secure,
+          family: 4,
           auth: { user: gmailUser, pass: gmailPass },
-          connectionTimeout: 8000,
-          greetingTimeout: 8000,
-          socketTimeout: 8000
+          connectionTimeout: 15000,
+          greetingTimeout: 15000,
+          socketTimeout: 15000
         });
 
         const info = await gmailTransporter.sendMail({
@@ -93,9 +106,11 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
           html: htmlText
         });
 
+        lastEmailError = '';
         console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to} (port ${port})! MessageID: ${info.messageId}`);
         return { success: true, provider: 'gmail', messageId: info.messageId };
       } catch (gErr) {
+        lastEmailError = `Gmail SMTP (port ${port}): ${gErr.message}`;
         console.error(`❌ GMAIL SMTP (port ${port}) ERROR: ${gErr.message}`);
       }
     }
@@ -122,30 +137,35 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
       });
       const resData = await response.json();
       if (response.ok && resData.id) {
+        lastEmailError = '';
         console.log(`✅ RESEND EMAIL DELIVERED TO ${to}! MessageID: ${resData.id}`);
         return { success: true, provider: 'resend', messageId: resData.id };
       } else {
+        lastEmailError = `Resend API: ${resData.message || JSON.stringify(resData)}`;
         console.warn('⚠️ Resend API notice:', resData.message || resData);
       }
     } catch (rErr) {
+      lastEmailError = `Resend API: ${rErr.message}`;
       console.warn('⚠️ Resend API Exception:', rErr.message);
     }
   }
 
   return {
     success: false,
-    error: 'Email delivery failed. Please check GMAIL_USER / GMAIL_APP_PASS in server/.env.'
+    error: lastEmailError || 'Email delivery failed. Please check GMAIL_USER / GMAIL_APP_PASS in server/.env.'
   };
 }
 
 // Hard cap on how long email dispatch may take. Registrations, resends and
-// invites must never hang for the user (nodemailer's default SMTP timeout is
-// 2 minutes); on timeout we report failure so callers hit the auto-activate
-// fallback instead of leaving the UI spinning on "Creating Account...".
+// invites must never hang for the user. The cap (30s) is well above the two
+// 15s-timeout SMTP attempts so the port-587 fallback actually gets a chance
+// instead of being killed mid-flight by a too-short race timer; on timeout we
+// report failure so callers hit the auto-activate fallback instead of leaving
+// the UI spinning on "Creating Account...".
 async function sendEmail(args) {
   return Promise.race([
     sendEmailImpl(args),
-    new Promise((resolve) => setTimeout(() => resolve({ success: false, error: 'Email delivery timed out.' }), 10000))
+    new Promise((resolve) => setTimeout(() => resolve({ success: false, error: 'Email delivery timed out.' }), 30000))
   ]);
 }
 
@@ -257,8 +277,76 @@ app.get('/api/health', (req, res) => {
     pgConnected: db.isPgConnected(),
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
+    lastEmailError: lastEmailError,
     timestamp: new Date().toISOString()
   });
+});
+
+// Live Email Diagnostics Endpoint: attempts a real SMTP send and returns the
+// exact error so the deployed environment can be diagnosed from the browser.
+// Sends a test message to the authenticated Gmail account itself (safe - no
+// data is touched, only a test email).
+app.get('/api/email/diag', async (req, res) => {
+  const gmailUser = (process.env.GMAIL_USER || '').trim();
+  const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
+  const resendKey = (process.env.RESEND_API_KEY || '').trim();
+
+  if (!gmailUser && !resendKey) {
+    return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS or RESEND_API_KEY.' });
+  }
+
+  const results = [];
+  if (gmailUser && gmailPass) {
+    for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
+      try {
+        const transporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com',
+          port,
+          secure,
+          family: 4,
+          auth: { user: gmailUser, pass: gmailPass },
+          connectionTimeout: 15000,
+          greetingTimeout: 15000,
+          socketTimeout: 15000
+        });
+        const info = await transporter.sendMail({
+          from: `"PulseRoom Messenger" <${gmailUser}>`,
+          to: gmailUser,
+          subject: 'PulseRoom email diagnostics test',
+          text: 'If you can read this, PulseRoom email sending works.',
+          html: '<b>If you can read this, PulseRoom email sending works.</b>'
+        });
+        results.push({ provider: 'gmail', port, ok: true, messageId: info.messageId });
+        break;
+      } catch (err) {
+        results.push({ provider: 'gmail', port, ok: false, error: err.message });
+      }
+    }
+  }
+
+  if (resendKey && (process.env.RESEND_DIAG_TO || gmailUser)) {
+    const diagTo = process.env.RESEND_DIAG_TO || gmailUser;
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'PulseRoom Messenger <onboarding@resend.dev>',
+          to: [diagTo],
+          subject: 'PulseRoom email diagnostics test',
+          html: '<b>If you can read this, PulseRoom email sending works.</b>'
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      const resData = await response.json();
+      results.push({ provider: 'resend', ok: response.ok, detail: resData.message || resData.id || resData });
+    } catch (err) {
+      results.push({ provider: 'resend', ok: false, error: err.message });
+    }
+  }
+
+  lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
@@ -335,7 +423,8 @@ app.post('/api/auth/register', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, na
       return res.status(201).json({
         message: `Account created successfully! Your email (${cleanEmail}) has been auto-activated. You can log in directly!`,
         email: cleanEmail,
-        autoConfirmed: true
+        autoConfirmed: true,
+        emailError: result.error
       });
     }
 
