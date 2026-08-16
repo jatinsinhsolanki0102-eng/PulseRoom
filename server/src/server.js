@@ -9,6 +9,7 @@ import multer from 'multer';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
 import dns from 'node:dns';
+import net from 'node:net';
 
 import { initDb, db } from './db.js';
 import { hashPassword, comparePassword, generateToken, generateConfirmationToken, verifyConfirmationToken, authenticateToken } from './auth.js';
@@ -148,7 +149,7 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          from: 'PulseRoom Messenger <onboarding@resend.dev>',
+          from: process.env.RESEND_FROM || 'PulseRoom Messenger <onboarding@resend.dev>',
           to: [to],
           subject,
           html: htmlText,
@@ -303,10 +304,30 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Raw TCP connectivity probe (short timeout) - used by the diagnostics
+// endpoint to isolate WHERE a send failure happens (DNS, port blocked by
+// platform, Gmail blackholing the server IP, auth rejected, etc).
+function tcpProbe(host, port, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    let settled = false;
+    const done = (ok, detail) => {
+      if (!settled) { settled = true; socket.destroy(); resolve({ ok, detail }); }
+    };
+    socket.once('connect', () => done(true, 'connected'));
+    socket.once('timeout', () => done(false, 'timeout'));
+    socket.once('error', (e) => done(false, e.message));
+    socket.connect(port, host);
+  });
+}
+
 // Live Email Diagnostics Endpoint: attempts a real SMTP send and returns the
 // exact error so the deployed environment can be diagnosed from the browser.
 // Sends a test message to the authenticated Gmail account itself (safe - no
-// data is touched, only a test email).
+// data is touched, only a test email). Also runs raw TCP probes against
+// smtp.gmail.com IPv4s and control hosts to separate "platform blocks SMTP
+// ports" from "Gmail blackholes this server IP" from "credentials are wrong".
 app.get('/api/email/diag', async (req, res) => {
   const gmailUser = (process.env.GMAIL_USER || '').trim();
   const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
@@ -316,6 +337,33 @@ app.get('/api/email/diag', async (req, res) => {
     return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS or RESEND_API_KEY.' });
   }
 
+  // 1. Raw TCP probes
+  const probes = [];
+  let gmailIps = [];
+  try {
+    const lookup = await dns.promises.lookup('smtp.gmail.com', { all: true, family: 4 });
+    gmailIps = [...new Set(lookup.map((x) => x.address))].slice(0, 3);
+  } catch (e) {
+    gmailIps = [];
+  }
+  for (const ip of gmailIps) {
+    for (const port of [465, 587, 25]) {
+      probes.push({ target: `smtp.gmail.com (${ip})`, port, ...(await tcpProbe(ip, port)) });
+    }
+  }
+  const controlHosts = [
+    { host: 'google.com', label: 'google.com (control)' },
+    { host: 'smtp-relay.brevo.com', label: 'smtp-relay.brevo.com (non-Gmail SMTP control)' },
+    { host: 'smtp.gmail.com', label: 'smtp.gmail.com (control, 443)' }
+  ];
+  for (const c of controlHosts) {
+    const port = c.label.includes('443') ? 443 : 587;
+    let ip = c.host;
+    try { ip = (await dns.promises.lookup(c.host, { family: 4 })).address; } catch (e) { /* keep hostname */ }
+    probes.push({ target: `${c.label} (${ip})`, port, ...(await tcpProbe(ip, port)) });
+  }
+
+  // 2. Full authenticated SMTP send
   const results = [];
   if (gmailUser && gmailPass) {
     const smtpHost = await resolveGmailIpv4();
@@ -354,7 +402,7 @@ app.get('/api/email/diag', async (req, res) => {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from: 'PulseRoom Messenger <onboarding@resend.dev>',
+          from: process.env.RESEND_FROM || 'PulseRoom Messenger <onboarding@resend.dev>',
           to: [diagTo],
           subject: 'PulseRoom email diagnostics test',
           html: '<b>If you can read this, PulseRoom email sending works.</b>'
@@ -369,7 +417,7 @@ app.get('/api/email/diag', async (req, res) => {
   }
 
   lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
-  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, results });
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, probes, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
