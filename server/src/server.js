@@ -242,9 +242,19 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Express Root Route: Redirect backend root GET / to Frontend Web App
+// Express Root Route: Redirect backend root GET / to Frontend Web App. When
+// the frontend is served from the SAME origin (single-service deploy), a
+// redirect to CLIENT_URL would loop forever, so serve the SPA index instead.
 app.get('/', (req, res) => {
-  res.redirect(getClientUrl());
+  const clientUrl = getClientUrl();
+  let sameOrigin = false;
+  try {
+    sameOrigin = req.get('host') === new URL(clientUrl).host;
+  } catch (e) { /* ignore malformed CLIENT_URL */ }
+  if (sameOrigin && clientDist) {
+    return res.sendFile(path.join(clientDist, 'index.html'));
+  }
+  res.redirect(clientUrl);
 });
 
 // 1. Auth: Sign Up (Email Confirmation Required Before Login)
