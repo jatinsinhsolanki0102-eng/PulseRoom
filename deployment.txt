@@ -115,10 +115,13 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
        GMAIL_USER            = your@gmail.com      (email confirmations - LOCAL dev only,
                                                     see EMAIL SENDING note below)
        GMAIL_APP_PASS        = <16-char Gmail app password>  (LOCAL dev only)
-       RESEND_API_KEY        = <your Resend API key>  (REQUIRED for email on Render - see
-                                                       EMAIL SENDING note below)
+       SENDGRID_API_KEY      = <your SendGrid key>  (REQUIRED for email on Render -
+                                                     EASIEST path, no domain needed)
+       SENDGRID_FROM         = "PulseRoom <you@verified-email.com>"
+                                                    (sender you verified in SendGrid)
+       RESEND_API_KEY        = <your Resend API key>  (alternative, needs a verified
+                                                       domain)
        RESEND_FROM           = "PulseRoom <no-reply@your-verified-domain.com>"
-                                                    (REQUIRED for email on Render)
        CLIENT_URL            = https://pulseroom-jtaj.onrender.com
        APP_URL               = https://pulseroom-jtaj.onrender.com
        VAPID_PUBLIC_KEY      = <paste the public key from data/.vapid.json>
@@ -135,23 +138,26 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
     Gmail:443 time out, while api.resend.com (Cloudflare) and Supabase connect
     instantly. Gmail SMTP can therefore NEVER deliver from Render free - it is not
     an IP/port/code issue.
-  - Fix: email is now sent via the Resend HTTPS API (already in the code, works
-    from Render - same kind of HTTPS traffic as the app itself). The server
-    fast-skips Gmail (3s probe) when it is unreachable and uses Resend instead.
-  - TO ACTIVATE EMAIL ON RENDER (2 env vars + 1 Resend setup):
-      1. Add RESEND_API_KEY (the one already in server/.env) to Render env.
-      2. On resend.com verify a domain (Settings -> Domains -> add -> follow the
-         DNS records) so you can send to ANY user, then set:
-         RESEND_FROM = PulseRoom <no-reply@your-domain.com>
-         (Without a verified domain, Resend's onboarding@resend.dev sender can
-          only deliver to YOUR OWN account email - fine for testing, useless for
-          real users.)
-      3. Optional: RESEND_DIAG_TO = <your email> so GET /api/email/diag can also
-         test the Resend path.
-  - Gmail SMTP stays as a fallback: it still works for local dev (your PC can reach
-    Gmail) and will be used automatically if the server CAN reach smtp.gmail.com.
+  - Fix: email is sent via HTTPS APIs instead of raw SMTP. The dispatcher order is:
+      Gmail SMTP  ->  SendGrid API  ->  Resend API
+    Gmail is fast-skipped when unreachable (3s probe) so it never wastes time on
+    Render. SendGrid/Resend run over HTTPS, which works from Render.
+  - EASIEST PATH (no domain needed): SendGrid. Verify only a SENDER EMAIL
+    (no domain/DNS), then add to Render env:
+       SENDGRID_API_KEY = <your key from app.sendgrid.com -> Settings -> API Keys>
+       SENDGRID_FROM    = "PulseRoom <you@verified-email.com>"  (must match the
+                          email you verified in SendGrid)
+    Free tier: 100 emails/day - enough for a start.
+  - Alternative: Resend. Needs a VERIFIED DOMAIN (you must own one and add DNS
+    records). Add to Render env:
+       RESEND_API_KEY = <your key from resend.com>
+       RESEND_FROM    = "PulseRoom <no-reply@your-domain.com>"
+    Without a verified domain, Resend's onboarding@resend.dev sender can only
+    deliver to YOUR OWN account email - useless for real users.
+  - Gmail SMTP stays as a fallback for local dev only (your PC can reach Gmail).
   - Diagnostics: GET /api/email/diag (live SMTP send + raw TCP probes + HTTPS
-    egress + DB ping), and GET /api/health shows the lastEmailError.
+    egress + DB ping + SendGrid/Resend tests), and GET /api/health shows the
+    lastEmailError and which providers are configured.
 
 
   DATABASE_URL - SUPABASE CONNECTION METHOD (learned the hard way):

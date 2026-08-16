@@ -65,6 +65,18 @@ app.set('trust proxy', 1);
 // hit ENETUNREACH / blackhole timeouts. Same fix already applied for Postgres.
 dns.setDefaultResultOrder('ipv4first');
 
+// Parse a sender string of the form `"Name <email>"` or just `email` into the
+// { email, name } object that HTTPS email APIs expect.
+function parseSender(raw) {
+  const s = String(raw || '').trim();
+  const match = s.match(/^(.*?)\s*<\s*([^>]+)\s*>$/);
+  if (match) {
+    const name = match[1].trim().replace(/^"|"$/g, '');
+    return { email: match[2].trim(), name: name || undefined };
+  }
+  return { email: s, name: undefined };
+}
+
 // Last email error (for diagnostics - /api/health, /api/email/diag, register).
 // Set on every failed attempt so the UI and ops can see the real reason
 // (wrong app password, IP blocked by Gmail, TLS error, timeout, etc).
@@ -147,7 +159,46 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 2: Resend API
+  // Priority 2: SendGrid API (free tier, NO domain needed - only a verified
+  // sender email). Pure HTTPS so it works from Render where Google SMTP is
+  // blackholed, and it delivers to ANY recipient.
+  const sgKey = (process.env.SENDGRID_API_KEY || '').trim();
+  const sgFromRaw = (process.env.SENDGRID_FROM || '').trim();
+  if (sgKey && sgFromRaw) {
+    console.log(`🔄 Dispatching via SendGrid API...`);
+    try {
+      const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${sgKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: to }] }],
+          from: parseSender(sgFromRaw),
+          subject,
+          content: [
+            { type: 'text/plain', value: plainText || '' },
+            { type: 'text/html', value: htmlText || '' }
+          ]
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (response.ok) {
+        lastEmailError = '';
+        console.log(`✅ SENDGRID EMAIL DELIVERED TO ${to}! HTTP ${response.status}`);
+        return { success: true, provider: 'sendgrid', messageId: `sendgrid-${Date.now()}` };
+      }
+      const resData = await response.json().catch(() => ({}));
+      lastEmailError = `SendGrid API: HTTP ${response.status} ${JSON.stringify(resData.errors || resData).slice(0, 300)}`;
+      console.warn('⚠️ SendGrid API notice:', response.status, resData);
+    } catch (sgErr) {
+      lastEmailError = `SendGrid API: ${sgErr.message}`;
+      console.warn('⚠️ SendGrid API Exception:', sgErr.message);
+    }
+  }
+
+  // Priority 3: Resend API
   if (resendKey) {
     console.log(`🔄 Dispatching via Resend API...`);
     try {
@@ -307,6 +358,7 @@ app.get('/api/health', (req, res) => {
     app: 'PulseRoom Real-Time Engine',
     pgConnected: db.isPgConnected(),
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
+    sendgridConfigured: Boolean(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM),
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
     lastEmailError: lastEmailError,
     timestamp: new Date().toISOString()
@@ -387,7 +439,6 @@ app.get('/api/email/diag', async (req, res) => {
   }
   const dbPing = await db.ping();
 
-  // 3. Full authenticated SMTP send
   const results = [];
   if (gmailUser && gmailPass) {
     const smtpHost = await resolveGmailIpv4();
@@ -419,6 +470,35 @@ app.get('/api/email/diag', async (req, res) => {
     }
   }
 
+  // 4. SendGrid send test (HTTPS API - works on Render without a domain)
+  const sgKey = (process.env.SENDGRID_API_KEY || '').trim();
+  const sgFromRaw = (process.env.SENDGRID_FROM || '').trim();
+  const sgDiagTo = process.env.SENDGRID_DIAG_TO || process.env.RESEND_DIAG_TO || gmailUser;
+  if (sgKey && sgFromRaw && sgDiagTo) {
+    try {
+      const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${sgKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: sgDiagTo }] }],
+          from: parseSender(sgFromRaw),
+          subject: 'PulseRoom email diagnostics test',
+          content: [{ type: 'text/plain', value: 'If you can read this, PulseRoom email sending works.' }]
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (response.ok) {
+        results.push({ provider: 'sendgrid', ok: true, status: response.status });
+      } else {
+        const resData = await response.json().catch(() => ({}));
+        results.push({ provider: 'sendgrid', ok: false, status: response.status, error: JSON.stringify(resData.errors || resData).slice(0, 300) });
+      }
+    } catch (err) {
+      results.push({ provider: 'sendgrid', ok: false, error: err.message });
+    }
+  }
+
+  // 5. Resend send test
   if (resendKey && (process.env.RESEND_DIAG_TO || gmailUser)) {
     const diagTo = process.env.RESEND_DIAG_TO || gmailUser;
     try {
@@ -441,7 +521,7 @@ app.get('/api/email/diag', async (req, res) => {
   }
 
   lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
-  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), sendgrid: Boolean(sgKey && sgFromRaw), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
