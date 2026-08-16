@@ -69,31 +69,35 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   console.log(`\n📧 Dispatching Email to ${to}...`);
 
   // Priority 1: Direct Gmail SMTP Engine (Universal Delivery to ANY Email Worldwide)
+  // Try explicit-TLS port 465 first, then STARTTLS port 587 (some hosting
+  // networks only allow one of them).
   if (gmailUser && gmailPass) {
     console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
-    try {
-      const gmailTransporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 465,
-        secure: true,
-        auth: { user: gmailUser, pass: gmailPass },
-        connectionTimeout: 8000,
-        greetingTimeout: 8000,
-        socketTimeout: 8000
-      });
+    for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
+      try {
+        const gmailTransporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com',
+          port,
+          secure,
+          auth: { user: gmailUser, pass: gmailPass },
+          connectionTimeout: 8000,
+          greetingTimeout: 8000,
+          socketTimeout: 8000
+        });
 
-      const info = await gmailTransporter.sendMail({
-        from: `"PulseRoom Messenger" <${gmailUser}>`,
-        to,
-        subject,
-        text: plainText,
-        html: htmlText
-      });
+        const info = await gmailTransporter.sendMail({
+          from: `"PulseRoom Messenger" <${gmailUser}>`,
+          to,
+          subject,
+          text: plainText,
+          html: htmlText
+        });
 
-      console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to}! MessageID: ${info.messageId}`);
-      return { success: true, provider: 'gmail', messageId: info.messageId };
-    } catch (gErr) {
-      console.error(`❌ GMAIL SMTP ERROR: ${gErr.message}`);
+        console.log(`✅ GMAIL SMTP EMAIL DELIVERED TO ${to} (port ${port})! MessageID: ${info.messageId}`);
+        return { success: true, provider: 'gmail', messageId: info.messageId };
+      } catch (gErr) {
+        console.error(`❌ GMAIL SMTP (port ${port}) ERROR: ${gErr.message}`);
+      }
     }
   }
 
