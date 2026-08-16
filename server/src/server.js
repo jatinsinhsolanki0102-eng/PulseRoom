@@ -104,9 +104,18 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   // networks only allow one of them). Generous timeouts: cloud egress paths
   // (Render free tier) can be slow to reach smtp.gmail.com.
   if (gmailUser && gmailPass) {
-    console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
     const smtpHost = await resolveGmailIpv4();
+    // Fast pre-flight: Gmail blackholes some datacenter/cloud egress IPs at the
+    // network level (Render free tier is one of them), so raw SMTP to
+    // smtp.gmail.com never connects. Probe once (3s) and skip straight to
+    // Resend instead of burning two 15s SMTP timeouts per email.
+    const gmailReachable = await tcpProbe(smtpHost, 465, 3000);
+    if (!gmailReachable.ok) {
+      lastEmailError = `Gmail SMTP unreachable from this server (probe ${smtpHost}:465 ${gmailReachable.detail}) - Google likely blocks this IP. Skipping to Resend.`;
+      console.warn(`⚠️ ${lastEmailError}`);
+    }
     for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
+      if (!gmailReachable.ok) break;
       try {
         const gmailTransporter = nodemailer.createTransport({
           host: smtpHost,
