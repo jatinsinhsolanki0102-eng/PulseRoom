@@ -12,6 +12,10 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL || `postgres://${process.env.PGUSER || 'postgres'}:${process.env.PGPASSWORD || 'postgres'}@${process.env.PGHOST || 'localhost'}:${process.env.PGPORT || 5432}/${process.env.PGDATABASE || 'pulseroom'}`,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   connectionTimeoutMillis: 3000,
+  // Force IPv4: hostnames like Supabase's db.<ref>.supabase.co resolve to an
+  // IPv6 address first, and hosting platforms without IPv6 then fail with
+  // ENETUNREACH instead of falling back to IPv4.
+  family: 4,
 });
 
 let isPgConnected = false;
