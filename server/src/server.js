@@ -69,6 +69,25 @@ dns.setDefaultResultOrder('ipv4first');
 // (wrong app password, IP blocked by Gmail, TLS error, timeout, etc).
 let lastEmailError = '';
 
+// Resolve smtp.gmail.com to an IPv4 literal. nodemailer's built-in resolver
+// randomly picks one address from ALL A + AAAA records (ignoring family:4),
+// so on IPv4-only hosts (Render free tier, no IPv6 route) it can randomly
+// choose Gmail's IPv6 address and die with ENETUNREACH / blackhole timeout.
+// Passing a literal IPv4 as `host` makes nodemailer skip its resolver
+// entirely; `servername` keeps TLS SNI/cert validation on smtp.gmail.com.
+let cachedSmtpIpv4 = '';
+async function resolveGmailIpv4() {
+  if (cachedSmtpIpv4) return cachedSmtpIpv4;
+  try {
+    const { address } = await dns.promises.lookup('smtp.gmail.com', { family: 4 });
+    cachedSmtpIpv4 = address;
+    return cachedSmtpIpv4;
+  } catch (e) {
+    console.error('⚠️ smtp.gmail.com IPv4 resolution failed, falling back to hostname:', e.message);
+    return 'smtp.gmail.com';
+  }
+}
+
 // Universal Email Dispatcher Engine (Gmail SMTP Priority #1 for 100% Universal Delivery to ANY Email)
 async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   dotenv.config({ override: true });
@@ -85,10 +104,12 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   // (Render free tier) can be slow to reach smtp.gmail.com.
   if (gmailUser && gmailPass) {
     console.log(`🚀 Dispatching via Gmail SMTP (${gmailUser})...`);
+    const smtpHost = await resolveGmailIpv4();
     for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
       try {
         const gmailTransporter = nodemailer.createTransport({
-          host: 'smtp.gmail.com',
+          host: smtpHost,
+          servername: 'smtp.gmail.com',
           port,
           secure,
           family: 4,
@@ -297,10 +318,12 @@ app.get('/api/email/diag', async (req, res) => {
 
   const results = [];
   if (gmailUser && gmailPass) {
+    const smtpHost = await resolveGmailIpv4();
     for (const { port, secure } of [{ port: 465, secure: true }, { port: 587, secure: false }]) {
       try {
         const transporter = nodemailer.createTransport({
-          host: 'smtp.gmail.com',
+          host: smtpHost,
+          servername: 'smtp.gmail.com',
           port,
           secure,
           family: 4,
