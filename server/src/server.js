@@ -59,7 +59,7 @@ const PORT = process.env.PORT || 5000;
 app.set('trust proxy', 1);
 
 // Universal Email Dispatcher Engine (Gmail SMTP Priority #1 for 100% Universal Delivery to ANY Email)
-async function sendEmail({ to, subject, htmlText, plainText }) {
+async function sendEmailImpl({ to, subject, htmlText, plainText }) {
   dotenv.config({ override: true });
 
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
@@ -76,7 +76,10 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
         host: 'smtp.gmail.com',
         port: 465,
         secure: true,
-        auth: { user: gmailUser, pass: gmailPass }
+        auth: { user: gmailUser, pass: gmailPass },
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 8000
       });
 
       const info = await gmailTransporter.sendMail({
@@ -110,7 +113,8 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
           subject,
           html: htmlText,
           text: plainText
-        })
+        }),
+        signal: AbortSignal.timeout(8000)
       });
       const resData = await response.json();
       if (response.ok && resData.id) {
@@ -128,6 +132,17 @@ async function sendEmail({ to, subject, htmlText, plainText }) {
     success: false,
     error: 'Email delivery failed. Please check GMAIL_USER / GMAIL_APP_PASS in server/.env.'
   };
+}
+
+// Hard cap on how long email dispatch may take. Registrations, resends and
+// invites must never hang for the user (nodemailer's default SMTP timeout is
+// 2 minutes); on timeout we report failure so callers hit the auto-activate
+// fallback instead of leaving the UI spinning on "Creating Account...".
+async function sendEmail(args) {
+  return Promise.race([
+    sendEmailImpl(args),
+    new Promise((resolve) => setTimeout(() => resolve({ success: false, error: 'Email delivery timed out.' }), 10000))
+  ]);
 }
 
 // Setup CORS - restricted to the configured frontend origin(s).
