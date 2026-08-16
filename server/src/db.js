@@ -2,9 +2,15 @@ import pkg from 'pg';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import dns from 'node:dns';
 import { v4 as uuidv4 } from 'uuid';
 
 dotenv.config();
+
+// Resolve hostnames to IPv4 first. Hosts like Supabase's db.<ref>.supabase.co
+// answer with an AAAA (IPv6) record before the A (IPv4) record, and hosting
+// platforms without IPv6 then fail with ENETUNREACH instead of falling back.
+dns.setDefaultResultOrder('ipv4first');
 
 const { Pool } = pkg;
 
