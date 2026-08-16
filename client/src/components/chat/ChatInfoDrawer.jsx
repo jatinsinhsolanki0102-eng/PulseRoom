@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useE2EE } from '../../context/E2EEContext';
-import { X, Pin, Users, Trash2, Eraser, UserPlus, Image as ImageIcon, Shield, Heart, Timer, Ban, ShieldOff, ShieldCheck } from 'lucide-react';
+import { X, Pin, Users, Trash2, Eraser, UserPlus, Image as ImageIcon, Shield, Heart, Timer, Ban, ShieldOff, ShieldCheck, Star, Clock, Bell, BellOff, Pencil, LogOut, UserX, Crown, Archive, Mail } from 'lucide-react';
 import AddMembersModal from '../groups/AddMembersModal';
+import EditGroupModal from '../groups/EditGroupModal';
 
 const DISAPPEARING_OPTIONS = [
   { value: 0, label: 'Off' },
@@ -11,19 +12,23 @@ const DISAPPEARING_OPTIONS = [
   { value: 90 * 24 * 3600, label: '90 days' }
 ];
 
-export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteChat, onClearChat, onMembersAdded, onBlockUser }) {
+export default function ChatInfoDrawer({ room, onClose, onTogglePin, onToggleMute, onToggleArchive, onToggleUnread, onDeleteChat, onClearChat, onMembersAdded, onBlockUser, onOpenGallery, onOpenStarred, onOpenScheduled, onRoomChanged, onLeaveGroup }) {
   const { user, token } = useAuth();
   const { fetchRecipientKey } = useE2EE();
   const [showAddMembers, setShowAddMembers] = useState(false);
+  const [showEditGroup, setShowEditGroup] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [confirmBlock, setConfirmBlock] = useState(false);
   const [disappearing, setDisappearing] = useState(room?.disappearing_seconds || 0);
   const [savingTimer, setSavingTimer] = useState(false);
   const [verification, setVerification] = useState(null); // null | true | false | 'legacy'
+  const [isMuted, setIsMuted] = useState(Boolean(room?.is_muted));
+  const [busyMemberId, setBusyMemberId] = useState(null);
 
   useEffect(() => {
     setDisappearing(room?.disappearing_seconds || 0);
+    setIsMuted(Boolean(room?.is_muted));
   }, [room?.id]);
 
   useEffect(() => {
@@ -73,6 +78,26 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
     }
   };
 
+  const handleToggleMute = async () => {
+    const target = !isMuted;
+    try {
+      const res = await fetch(`/api/rooms/${room.id}/mute`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setIsMuted(Boolean(data.is_muted));
+        if (onToggleMute) onToggleMute(room.id, Boolean(data.is_muted));
+      }
+    } catch (err) {
+      console.error('Failed to toggle mute:', err);
+    }
+  };
+
   const handleSetDisappearing = async (seconds) => {
     setSavingTimer(true);
     try {
@@ -94,8 +119,58 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
     }
   };
 
+  const handleRoleChange = async (member, newRole) => {
+    setBusyMemberId(member.id);
+    try {
+      const res = await fetch(`/api/rooms/${room.id}/members/${member.id}/role`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ role: newRole })
+      });
+      if (res.ok) {
+        if (onRoomChanged) onRoomChanged();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Failed to update role.');
+      }
+    } catch (err) {
+      console.error('Failed to update role:', err);
+    } finally {
+      setBusyMemberId(null);
+    }
+  };
+
+  const handleRemoveMember = async (member) => {
+    if (!window.confirm(`Remove ${member.username} from this group?`)) return;
+    setBusyMemberId(member.id);
+    try {
+      const res = await fetch(`/api/rooms/${room.id}/members/${member.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        if (onRoomChanged) onRoomChanged();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Failed to remove member.');
+      }
+    } catch (err) {
+      console.error('Failed to remove member:', err);
+    } finally {
+      setBusyMemberId(null);
+    }
+  };
+
+  const handleLeaveGroup = () => {
+    if (window.confirm(`Leave "${room.name || 'this group'}"? You can be re-added by an admin later.`)) {
+      if (onLeaveGroup) onLeaveGroup();
+    }
+  };
+
+  const isGroupAdmin = !isPrivate && room.role === 'admin';
+
   return (
-    <div style={{
+    <div className="chat-info-drawer" style={{
       width: '320px',
       height: '100%',
       borderLeft: '1px solid var(--panel-border)',
@@ -130,7 +205,18 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
         <h3 style={{ fontFamily: 'Outfit', fontWeight: '700', fontSize: '1.25rem', color: 'var(--text-main)' }}>{name}</h3>
         <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>{bio || 'No description provided'}</p>
 
-        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', marginTop: '1rem' }}>
+        <div className="chip-action-row" style={{
+          display: 'flex',
+          gap: '0.5rem',
+          marginTop: '1rem',
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          flexWrap: 'nowrap',
+          justifyContent: 'flex-start',
+          padding: '0 0 0.4rem',
+          scrollbarWidth: 'thin',
+          WebkitOverflowScrolling: 'touch'
+        }}>
           <button
             onClick={onTogglePin}
             className="chip-btn"
@@ -139,14 +225,69 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
               borderRadius: '99px',
               background: room.is_pinned ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
               color: room.is_pinned ? 'white' : 'var(--text-main)',
-              fontWeight: '600'
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
             }}
           >
             <Pin size={14} style={{ display: 'inline', marginRight: '4px' }} />
             {room.is_pinned ? 'Unpin Chat' : 'Pin Chat'}
           </button>
 
-          {!isPrivate && (
+          <button
+            onClick={handleToggleMute}
+            className="chip-btn"
+            style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '99px',
+              background: isMuted ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
+              color: isMuted ? 'white' : 'var(--text-main)',
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
+            }}
+          >
+            {isMuted
+              ? <BellOff size={14} style={{ display: 'inline', marginRight: '4px' }} />
+              : <Bell size={14} style={{ display: 'inline', marginRight: '4px' }} />}
+            {isMuted ? 'Unmute' : 'Mute'}
+          </button>
+
+          <button
+            onClick={() => onToggleArchive(room.id)}
+            className="chip-btn"
+            style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '99px',
+              background: room.is_archived ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
+              color: room.is_archived ? 'white' : 'var(--text-main)',
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
+            }}
+          >
+            <Archive size={14} style={{ display: 'inline', marginRight: '4px' }} />
+            {room.is_archived ? 'Unarchive' : 'Archive'}
+          </button>
+
+          <button
+            onClick={() => onToggleUnread(room.id)}
+            className="chip-btn"
+            style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '99px',
+              background: room.is_unread ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
+              color: room.is_unread ? 'white' : 'var(--text-main)',
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
+            }}
+          >
+            <Mail size={14} style={{ display: 'inline', marginRight: '4px' }} />
+            {room.is_unread ? 'Mark as read' : 'Mark as unread'}
+          </button>
+
+          {isGroupAdmin && (
             <button
               onClick={() => setShowAddMembers(true)}
               className="chip-btn"
@@ -155,7 +296,9 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
                 borderRadius: '99px',
                 background: 'rgba(255,255,255,0.06)',
                 color: 'var(--text-main)',
-                fontWeight: '600'
+                fontWeight: '600',
+                flex: '0 0 auto',
+                whiteSpace: 'nowrap'
               }}
             >
               <UserPlus size={14} style={{ display: 'inline', marginRight: '4px' }} />
@@ -172,7 +315,9 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
                 borderRadius: '99px',
                 background: confirmBlock ? '#ef4444' : 'rgba(255,255,255,0.06)',
                 color: confirmBlock ? 'white' : '#f87171',
-                fontWeight: '600'
+                fontWeight: '600',
+                flex: '0 0 auto',
+                whiteSpace: 'nowrap'
               }}
             >
               {confirmBlock ? <ShieldOff size={14} style={{ display: 'inline', marginRight: '4px' }} /> : <Ban size={14} style={{ display: 'inline', marginRight: '4px' }} />}
@@ -188,7 +333,9 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
               borderRadius: '99px',
               background: confirmClear ? '#f59e0b' : 'rgba(255,255,255,0.06)',
               color: confirmClear ? 'white' : '#fbbf24',
-              fontWeight: '600'
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
             }}
           >
             <Eraser size={14} style={{ display: 'inline', marginRight: '4px' }} />
@@ -203,7 +350,9 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
               borderRadius: '99px',
               background: confirmDelete ? '#ef4444' : 'rgba(255,255,255,0.06)',
               color: confirmDelete ? 'white' : '#f87171',
-              fontWeight: '600'
+              fontWeight: '600',
+              flex: '0 0 auto',
+              whiteSpace: 'nowrap'
             }}
           >
             <Trash2 size={14} style={{ display: 'inline', marginRight: '4px' }} />
@@ -263,6 +412,42 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
         </div>
       </div>
 
+      {/* Shortcuts: Media / Starred / Scheduled */}
+      <div style={{ padding: '1.25rem', borderBottom: '1px solid var(--panel-border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', fontWeight: '700', color: 'var(--text-muted)', marginBottom: '0.75rem' }}>
+          <ImageIcon size={16} /> Shortcuts
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          {onOpenGallery && (
+            <button
+              onClick={onOpenGallery}
+              className="chip-btn"
+              style={{ padding: '0.5rem 0.9rem', borderRadius: '12px', background: 'rgba(255,255,255,0.06)', color: 'var(--text-main)', fontWeight: '600', textAlign: 'left', fontSize: '0.85rem' }}
+            >
+              <ImageIcon size={14} style={{ display: 'inline', marginRight: '6px' }} /> Media Gallery
+            </button>
+          )}
+          {onOpenStarred && (
+            <button
+              onClick={onOpenStarred}
+              className="chip-btn"
+              style={{ padding: '0.5rem 0.9rem', borderRadius: '12px', background: 'rgba(255,255,255,0.06)', color: 'var(--text-main)', fontWeight: '600', textAlign: 'left', fontSize: '0.85rem' }}
+            >
+              <Star size={14} style={{ display: 'inline', marginRight: '6px', color: '#facc15' }} /> Starred Messages
+            </button>
+          )}
+          {onOpenScheduled && (
+            <button
+              onClick={onOpenScheduled}
+              className="chip-btn"
+              style={{ padding: '0.5rem 0.9rem', borderRadius: '12px', background: 'rgba(255,255,255,0.06)', color: 'var(--text-main)', fontWeight: '600', textAlign: 'left', fontSize: '0.85rem' }}
+            >
+              <Clock size={14} style={{ display: 'inline', marginRight: '6px' }} /> Scheduled Messages
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Disappearing Messages Setting */}
       <div style={{ padding: '1.25rem', borderBottom: '1px solid var(--panel-border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', fontWeight: '700', color: 'var(--text-muted)', marginBottom: '0.75rem' }}>
@@ -295,6 +480,33 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
         </p>
       </div>
 
+      {/* Group Management: edit info / leave group */}
+      {!isPrivate && (
+        <div style={{ padding: '1.25rem', borderBottom: '1px solid var(--panel-border)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', fontWeight: '700', color: 'var(--text-muted)', marginBottom: '0.75rem' }}>
+            <Users size={16} /> Group Management
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            {isGroupAdmin && (
+              <button
+                onClick={() => setShowEditGroup(true)}
+                className="chip-btn"
+                style={{ padding: '0.5rem 0.9rem', borderRadius: '12px', background: 'rgba(255,255,255,0.06)', color: 'var(--text-main)', fontWeight: '600', textAlign: 'left', fontSize: '0.85rem' }}
+              >
+                <Pencil size={14} style={{ display: 'inline', marginRight: '6px', color: 'var(--primary-accent)' }} /> Edit Group Info
+              </button>
+            )}
+            <button
+              onClick={handleLeaveGroup}
+              className="chip-btn"
+              style={{ padding: '0.5rem 0.9rem', borderRadius: '12px', background: 'rgba(255,255,255,0.06)', color: '#f87171', fontWeight: '600', textAlign: 'left', fontSize: '0.85rem' }}
+            >
+              <LogOut size={14} style={{ display: 'inline', marginRight: '6px' }} /> Leave Group
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Group Members Roster */}
       {!isPrivate && (
         <div style={{ padding: '1.25rem', flex: 1, overflowY: 'auto' }}>
@@ -303,15 +515,61 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-            {(room.members || []).map(m => (
-              <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.4rem 0.5rem', borderRadius: '10px', background: 'rgba(255,255,255,0.02)' }}>
-                <img src={m.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${m.username}`} alt={m.username} style={{ width: '32px', height: '32px', borderRadius: '10px' }} />
-                <span style={{ flex: 1, fontWeight: '600', fontSize: '0.9rem' }}>{m.username}</span>
-                {m.role === 'admin' && (
-                  <span className="badge-tag badge-group" style={{ fontSize: '0.6rem' }}>Admin</span>
-                )}
-              </div>
-            ))}
+            {(room.members || []).map(m => {
+              const isSelf = String(m.id) === String(user?.id);
+              const isMemberAdmin = m.role === 'admin';
+              return (
+                <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.4rem 0.5rem', borderRadius: '10px', background: 'rgba(255,255,255,0.02)' }}>
+                  <img src={m.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${m.username}`} alt={m.username} style={{ width: '32px', height: '32px', borderRadius: '10px' }} />
+                  <span style={{ flex: 1, fontWeight: '600', fontSize: '0.9rem' }}>
+                    {m.username}{isSelf ? ' (You)' : ''}
+                  </span>
+                  {isMemberAdmin && (
+                    <span className="badge-tag badge-group" style={{ fontSize: '0.6rem' }}>
+                      <Crown size={10} style={{ display: 'inline', verticalAlign: '-1px', marginRight: '2px' }} /> Admin
+                    </span>
+                  )}
+                  {isGroupAdmin && !isSelf && (
+                    <div style={{ display: 'flex', gap: '0.3rem', flexShrink: 0 }}>
+                      <button
+                        title={isMemberAdmin ? 'Demote from admin' : 'Promote to admin'}
+                        onClick={() => handleRoleChange(m, isMemberAdmin ? 'member' : 'admin')}
+                        disabled={busyMemberId === m.id}
+                        style={{
+                          background: isMemberAdmin ? 'rgba(245,158,11,0.15)' : 'rgba(16,185,129,0.15)',
+                          border: 'none',
+                          color: isMemberAdmin ? '#fbbf24' : '#10b981',
+                          borderRadius: '8px',
+                          padding: '0.3rem 0.4rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center'
+                        }}
+                      >
+                        {isMemberAdmin ? <ShieldOff size={13} /> : <ShieldCheck size={13} />}
+                      </button>
+                      <button
+                        title="Remove from group"
+                        onClick={() => handleRemoveMember(m)}
+                        disabled={busyMemberId === m.id}
+                        style={{
+                          background: 'rgba(239,68,68,0.15)',
+                          border: 'none',
+                          color: '#f87171',
+                          borderRadius: '8px',
+                          padding: '0.3rem 0.4rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center'
+                        }}
+                      >
+                        <UserX size={13} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -323,6 +581,17 @@ export default function ChatInfoDrawer({ room, onClose, onTogglePin, onDeleteCha
           onMembersAdded={(updatedRoom) => {
             onMembersAdded(updatedRoom);
             setShowAddMembers(false);
+          }}
+        />
+      )}
+
+      {showEditGroup && (
+        <EditGroupModal
+          room={room}
+          onClose={() => setShowEditGroup(false)}
+          onGroupUpdated={(updated) => {
+            if (onRoomChanged) onRoomChanged(room.id);
+            setShowEditGroup(false);
           }}
         />
       )}

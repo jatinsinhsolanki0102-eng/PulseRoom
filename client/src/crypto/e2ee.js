@@ -348,6 +348,16 @@ export async function senderKeyDecrypt(sk, nonceB64, cipherB64) {
   }
 }
 
+// Advances a sender-key chain by exactly one message step WITHOUT consuming a
+// message key. Used to resync a receiver whose stored chain has drifted from the
+// sender's (e.g. a message was chain-decrypted twice across tabs, or the
+// decrypted-cache was reset while the chain kept counting), by walking the chain
+// forward past already-seen positions until a ciphertext authenticates.
+export async function advanceSenderKey(chainKeyB64) {
+  const next = await senderKeyStep(chainKeyB64, 'next');
+  return bytesToB64(next);
+}
+
 // ---------- WhatsApp-style media encryption ----------
 // The raw file is encrypted client-side with a fresh random AES-256-GCM key
 // BEFORE it is uploaded. The server only ever sees (and stores) ciphertext, and

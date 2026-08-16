@@ -345,6 +345,71 @@ html, body, #root {
   color: #38bdf8;
 }
 
+.unread-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 0.4rem;
+  border-radius: 99px;
+  background: var(--primary-accent);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+/* Archived chats section (WhatsApp-style collapsed entry at list bottom) */
+.archived-section {
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--panel-border);
+  padding-top: 0.5rem;
+}
+
+.archived-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  background: transparent;
+  border: none;
+  border-radius: 12px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.archived-toggle:hover {
+  background: var(--card-hover);
+  color: var(--text-main);
+}
+
+.archived-toggle svg {
+  color: var(--primary-accent);
+}
+
+.archived-chevron {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  transition: transform 0.2s ease;
+}
+
+.chip-action-row::-webkit-scrollbar {
+  height: 6px;
+}
+
+.chip-action-row::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 99px;
+}
+
+.chip-action-row::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 /* --------------------------------------------------------------------------
    MAIN CHAT CONTAINER
    -------------------------------------------------------------------------- */
@@ -373,12 +438,16 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 1rem;
+  min-width: 0;
 }
 
 .chat-header-name {
   font-family: 'Outfit', sans-serif;
   font-weight: 700;
   font-size: 1.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-header-status {
@@ -413,6 +482,77 @@ html, body, #root {
   background: rgba(255, 255, 255, 0.1);
   color: var(--text-main);
   transform: translateY(-1px);
+}
+
+/* Sidebar hamburger menu */
+.sidebar-menu {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  min-width: 220px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  padding: 0.5rem;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.sidebar-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text-main);
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: var(--transition-fast);
+}
+
+.sidebar-menu-item svg {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.sidebar-menu-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--primary-accent);
+}
+
+.sidebar-menu-item:hover svg {
+  color: var(--primary-accent);
+}
+
+.sidebar-menu-divider {
+  height: 1px;
+  background: var(--panel-border);
+  margin: 0.35rem 0.25rem;
+}
+
+.sidebar-menu-danger,
+.sidebar-menu-danger:hover {
+  color: #f87171;
+}
+
+.sidebar-menu-danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.sidebar-menu-danger svg,
+.sidebar-menu-danger:hover svg {
+  color: #f87171;
 }
 
 /* --------------------------------------------------------------------------
@@ -479,6 +619,20 @@ html, body, #root {
   margin-bottom: 0.35rem;
 }
 
+.forwarded-label {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  margin-bottom: 0.25rem;
+  text-transform: uppercase;
+}
+
+.edited-label {
+  font-style: italic;
+  opacity: 0.85;
+}
+
 .bubble-meta {
   display: flex;
   align-items: center;
@@ -487,6 +641,52 @@ html, body, #root {
   margin-top: 0.35rem;
   font-size: 0.7rem;
   opacity: 0.75;
+}
+
+/* In-chat message search bar */
+.chat-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1.5rem;
+  border-bottom: 1px solid var(--panel-border);
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(20px);
+  z-index: 5;
+}
+
+.chat-search-icon {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.chat-search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-main);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+
+.chat-search-input::placeholder {
+  color: var(--text-dim);
+}
+
+.chat-search-count {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.chat-search-nav {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  flex-shrink: 0;
 }
 
 /* Reactions Badge Row */
@@ -820,8 +1020,49 @@ html, body, #root {
   .status-tray {
     padding: 0.6rem 0.5rem !important;
     gap: 0.4rem !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .status-tray-scroll {
     overflow-x: auto !important;
     -webkit-overflow-scrolling: touch;
+  }
+
+  /* Chat info drawer becomes a full-screen sheet on phones */
+  .chat-info-drawer {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    z-index: 60 !important;
+    border-left: none !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    animation: none !important;
+  }
+
+  /* Quick action chips scroll horizontally on narrow screens */
+  .quick-chips-bar {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+  }
+
+  .quick-chips-bar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Keep header status line from wrapping/overflowing */
+  .chat-header-status {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 46vw;
+  }
+
+  .sidebar-header {
+    padding: 0.7rem 0.85rem !important;
   }
 
   /* Modal bottom sheet layout on mobile phones */
@@ -839,4 +1080,392 @@ html, body, #root {
     border-radius: 24px 24px 0 0 !important;
     border-bottom: none !important;
   }
+}
+
+/* --------------------------------------------------------------------------
+   TABLET / MEDIUM WINDOWS — keep chat roomy without cramping two panes
+   -------------------------------------------------------------------------- */
+
+.chat-info-drawer {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (min-width: 769px) and (max-width: 1100px) {
+  .sidebar {
+    width: 300px !important;
+    min-width: 300px !important;
+  }
+
+  .chat-info-drawer {
+    width: 300px !important;
+  }
+
+  .sidebar-header {
+    padding: 0.9rem 1rem !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   SMALL PHONES — compact headers/avatars, prioritise chat space
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 400px) {
+  .chat-header {
+    gap: 0.35rem !important;
+  }
+
+  .chat-header-info {
+    gap: 0.55rem !important;
+  }
+
+  .action-icon-btn {
+    width: 34px !important;
+    height: 34px !important;
+  }
+
+  .header-actions {
+    gap: 0.1rem !important;
+  }
+
+  /* Hide secondary header actions on very small screens */
+  .header-action-gallery,
+  .header-action-call {
+    display: none !important;
+  }
+
+  .chat-header-name {
+    font-size: 1rem !important;
+  }
+
+  .chat-header-status {
+    font-size: 0.7rem !important;
+  }
+
+  .chat-header-info > .avatar-wrapper {
+    width: 38px !important;
+    height: 38px !important;
+  }
+
+  /* Compact sidebar header so the 5 icon buttons always fit */
+  .sidebar-header {
+    padding: 0.6rem 0.75rem !important;
+  }
+
+  .brand-badge {
+    font-size: 1.05rem !important;
+    gap: 0.5rem !important;
+  }
+
+  .brand-icon {
+    width: 32px !important;
+    height: 32px !important;
+  }
+}
+
+/* Ultra-narrow: hide the PulseRoom wordmark, keep the logo */
+@media (max-width: 360px) {
+  .brand-badge span {
+    display: none !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   SCROLL UTILITIES
+   -------------------------------------------------------------------------- */
+
+/* Status circles tray: thin/clean horizontal scrollbar on desktop */
+.status-tray-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+  -webkit-overflow-scrolling: touch;
+}
+
+.status-tray-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.status-tray-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 99px;
+}
+
+/* Standard thin scrollbars for the chat/room panes on desktop */
+.room-list::-webkit-scrollbar,
+.message-feed::-webkit-scrollbar {
+  width: 6px;
+}
+
+.room-list::-webkit-scrollbar-thumb,
+.message-feed::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 99px;
+}
+
+/* ================= Voice / Video Call Overlay ================= */
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(5, 8, 15, 0.92);
+  backdrop-filter: blur(14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.call-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  text-align: center;
+  padding: 2.5rem;
+  border-radius: 24px;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  min-width: 300px;
+}
+
+.call-avatar {
+  width: 110px;
+  height: 110px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.call-avatar-lg {
+  width: 140px;
+  height: 140px;
+}
+
+.call-name {
+  font-family: 'Outfit', sans-serif;
+  font-size: 1.4rem;
+  font-weight: 800;
+  color: var(--text-main);
+  margin: 0;
+}
+
+.call-status {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.call-actions {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.call-actions-active {
+  position: absolute;
+  bottom: 3rem;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.call-btn {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.call-btn:hover {
+  transform: scale(1.06);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.call-btn-decline {
+  background: #ef4444;
+  color: white;
+}
+
+.call-btn-decline:hover {
+  background: #dc2626;
+}
+
+.call-btn-accept {
+  background: #10b981;
+  color: white;
+}
+
+.call-btn-accept:hover {
+  background: #059669;
+}
+
+.call-btn-on {
+  background: #facc15;
+  color: #0f172a;
+}
+
+.call-active {
+  position: relative;
+  width: min(94vw, 900px);
+  height: min(88vh, 620px);
+  border-radius: 20px;
+  overflow: hidden;
+  background: #05080f;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.call-remote-wrap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.call-remote-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.call-top-bar {
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 0.5rem 1.25rem;
+  border-radius: 99px;
+  backdrop-filter: blur(6px);
+}
+
+.call-top-bar .call-name {
+  font-size: 1.05rem;
+}
+
+.call-local-pip {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: 150px;
+  height: 110px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  background: #0f172a;
+}
+
+.call-local-off {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.call-notice {
+  position: fixed;
+  top: 1.25rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 600;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid var(--panel-border);
+  color: var(--text-main);
+  padding: 0.65rem 1.25rem;
+  border-radius: 99px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  animation: slideDown 0.25s ease-out;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translate(-50%, -12px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ================= Media Gallery ================= */
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 0.5rem;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.gallery-cell {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border: none;
+  padding: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.gallery-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.gallery-thumb-skeleton {
+  background: linear-gradient(100deg, rgba(255,255,255,0.05) 40%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.05) 60%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s infinite;
+}
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+.gallery-thumb-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+/* ================= Schedule Picker ================= */
+.schedule-picker {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  right: 0.75rem;
+  z-index: 40;
+  padding: 1rem 1.25rem;
+  border-radius: 14px;
+  width: 300px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+}
+
+.composer-wrapper {
+  position: relative;
 }

@@ -24,6 +24,7 @@ import {
   initSenderKey,
   senderKeyEncrypt,
   senderKeyDecrypt,
+  advanceSenderKey,
   encryptFileBytes,
   decryptFileBytes,
   createIdentityBundle,
@@ -315,6 +316,73 @@ describe('group Sender Keys (Signal SenderKey pattern)', () => {
     const staleMsg = await senderKeyEncrypt(staleDevice, JSON.stringify({ text: 'stale', c: 2 }));
     // The recipient's chain has already advanced -> authentication fails.
     await expectAuthFailure(senderKeyDecrypt(recipientSk, staleMsg.nonce, staleMsg.cipher));
+  });
+
+  it('advanceSenderKey steps the chain one message position at a time', async () => {
+    const senderSk = await initSenderKey('room-4');
+    const recipientSk = { ...senderSk, chainKey: senderSk.chainKey };
+
+    // Sender produces three messages (m1 at pos 0, m2 at pos 1, m3 at pos 2).
+    const msgs = [];
+    for (let i = 1; i <= 3; i++) {
+      const m = await senderKeyEncrypt(senderSk, JSON.stringify({ text: `m${i}`, c: i }));
+      senderSk.chainKey = m.nextChainKey;
+      msgs.push(m);
+    }
+
+    // Recipient only processed message 1 -> their chain sits at position 1.
+    const d1 = await senderKeyDecrypt(recipientSk, msgs[0].nonce, msgs[0].cipher);
+    recipientSk.chainKey = d1.nextChainKey;
+
+    // Message 3 (position 2) cannot authenticate at the recipient's position 1.
+    await expectAuthFailure(senderKeyDecrypt(recipientSk, msgs[2].nonce, msgs[2].cipher));
+
+    // Walk the chain forward one step (past the missed message 2) -> m3 works.
+    recipientSk.chainKey = await advanceSenderKey(recipientSk.chainKey);
+    const d3 = await senderKeyDecrypt(recipientSk, msgs[2].nonce, msgs[2].cipher);
+    recipientSk.chainKey = d3.nextChainKey;
+    expect(JSON.parse(d3.plaintext).text).toBe('m3');
+    expect(recipientSk.chainKey).toBe(senderSk.chainKey);
+  });
+
+  it('recovering from an over-advanced chain: a plaintext resync restores reading', async () => {
+    const senderSk = await initSenderKey('room-5');
+    const initialChainKey = senderSk.chainKey;
+    const recipientSk = { ...senderSk, chainKey: initialChainKey };
+
+    // Sender produces three messages.
+    const msgs = [];
+    for (let i = 1; i <= 3; i++) {
+      const m = await senderKeyEncrypt(senderSk, JSON.stringify({ text: `m${i}`, c: i }));
+      senderSk.chainKey = m.nextChainKey;
+      msgs.push(m);
+    }
+
+    // Recipient mistakenly decrypts messages 1 AND 2 in a row (simulating the
+    // two-tabs bug where the same stream is consumed twice) - their chain is now
+    // PAST message 2's slot.
+    const d1 = await senderKeyDecrypt(recipientSk, msgs[0].nonce, msgs[0].cipher);
+    recipientSk.chainKey = d1.nextChainKey;
+    const d2 = await senderKeyDecrypt(recipientSk, msgs[1].nonce, msgs[1].cipher);
+    recipientSk.chainKey = d2.nextChainKey;
+    // Message 2 can no longer authenticate (its chain slot was already consumed).
+    await expectAuthFailure(senderKeyDecrypt(recipientSk, msgs[1].nonce, msgs[1].cipher));
+
+    // RESYNC: re-apply the initial chain (as a fresh sender-key distribution
+    // gives) and re-decrypt the true history in order.
+    recipientSk.chainKey = initialChainKey;
+    for (let i = 0; i < msgs.length; i++) {
+      const r = await senderKeyDecrypt(recipientSk, msgs[i].nonce, msgs[i].cipher);
+      recipientSk.chainKey = r.nextChainKey;
+      expect(JSON.parse(r.plaintext).text).toBe(`m${i + 1}`);
+    }
+    // Fully re-synced: chains match and the next live message decrypts.
+    const mNext = await senderKeyEncrypt(senderSk, JSON.stringify({ text: 'm4', c: 4 }));
+    senderSk.chainKey = mNext.nextChainKey;
+    const dNext = await senderKeyDecrypt(recipientSk, mNext.nonce, mNext.cipher);
+    recipientSk.chainKey = dNext.nextChainKey;
+    expect(JSON.parse(dNext.plaintext).text).toBe('m4');
+    expect(recipientSk.chainKey).toBe(senderSk.chainKey);
   });
 });
 

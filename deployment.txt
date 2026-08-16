@@ -1,0 +1,143 @@
+===============================================================================
+ PULSEROOM - DEPLOYMENT SOLUTION (FREE, NO PLATFORM COST)
+ Date: 14-Aug-2026
+===============================================================================
+MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
+  + Supabase (free) Postgres for durable data.
+  Everything works: real-time chat, uploads, push, background jobs.
+  Only ONE tiny code change is required (3 lines) - everything else is
+  environment variables in the Render dashboard.
+
+------------------------------------------------------------------------------
+ WHY THIS (and not the other options)
+------------------------------------------------------------------------------
+  - "Frontend on Render + Supabase" alone will NOT work: the app's real-time
+    chat (Socket.IO) and all /api/* calls come from the Node server. Without
+    it nothing works. (Supabase stores data; it is not the chat backend.)
+  - "Data on your own PC" works only if your PC is online 24/7, has a public
+    IP / DDNS + port forwarding, and you accept exposing PostgreSQL to the
+    internet. Fine for personal testing, bad for real users.
+  - One Render service hosting the WHOLE app avoids all cross-origin, CORS,
+    and socket-URL problems because the frontend and backend share one domain.
+
+------------------------------------------------------------------------------
+ WHAT GETS DEPLOYED WHERE
+------------------------------------------------------------------------------
+  Render free Web Service  -> the whole app (server/ + built client/dist)
+  Supabase free Postgres   -> durable database (accounts survive redeploys)
+  GitHub                   -> your code repo (Render auto-redeploys on push)
+
+------------------------------------------------------------------------------
+ THE ONLY CODE CHANGE NEEDED (3 lines) - serve the built frontend  >>> DONE <<<
+------------------------------------------------------------------------------
+  APPLIED on 16-Aug-2026 (server/src/server.js, just before the initDb().then
+  boot block): the Node server now serves the built React app. It is
+  cwd-robust - it finds client/dist under either <repo>/client/dist or
+  <repo-root-parent>/client/dist depending on where the platform runs
+  `node src/server.js`:
+
+    const clientDist = [
+      path.resolve(process.cwd(), 'client', 'dist'),
+      path.resolve(process.cwd(), '..', 'client', 'dist')
+    ].find((p) => fs.existsSync(p));
+    if (clientDist) {
+      app.use(express.static(clientDist));
+      app.get(/^\/(?!api\/|uploads\/|socket\.io).*/, (req, res, next) => {
+        if (req.path.includes('.')) return next();
+        res.sendFile(path.join(clientDist, 'index.html'));
+      });
+    }
+
+  Verified: server test suite still passes (14/14). No further code changes
+  are needed. Everything below is just settings.
+
+  (If you refuse any code change: deploy client/dist as a Render Static Site
+   and the server as a second Web Service - but then the client must also be
+   told the backend URL, which is MORE changes, and real-time needs a socket
+   URL edit. The single-service route above is the least-change path.)
+
+------------------------------------------------------------------------------
+ 1. SET UP THE FREE DATABASE (Supabase) - solves the data-loss problem
+------------------------------------------------------------------------------
+  Your real problem: data/ on Render's free disk is wiped on every redeploy,
+  so users would lose accounts. Fix = put the DB in the cloud (free, durable):
+
+  1. Sign up at supabase.com (free plan, no card).
+  2. Create a project -> note these:
+       - Database password you set
+       - Settings -> Database -> "Connection string" (postgresql://...)
+  3. That Postgres is permanent and free. On the NEXT Render deploy nothing is
+     lost because all data lives in Supabase, not on the server disk.
+
+  The server already auto-creates + migrates every table on first connect
+  (it runs in "PostgreSQL mode" whenever DATABASE_URL is reachable).
+
+------------------------------------------------------------------------------
+ 2. GITHUB
+------------------------------------------------------------------------------
+  1. Push this project to a GitHub repo (make sure node_modules / dist /
+     uploads / data / .env stay gitignored - they already are).
+  2. Render reads from GitHub, so every git push auto-redeploys.
+
+------------------------------------------------------------------------------
+ 3. RENDER - CREATE THE WEB SERVICE (free)
+------------------------------------------------------------------------------
+  1. render.com -> New -> Web Service -> connect your GitHub repo.
+  2. Service settings:
+       Name:            pulseroom
+       Region:          any (nearest to your users)
+       Build Command:   cd server && npm install && cd ../client && npm install && npm run build
+       Start Command:   node src/server.js
+       Instance Type:   Free
+  3. Environment Variables (Project/Settings -> Environment) - THE CRITICAL PART:
+       NODE_ENV              = production          (turns on PG SSL - required by Supabase)
+       DATABASE_URL          = postgresql://...    (Supabase connection string)
+       JWT_SECRET            = <a long random string>  (REQUIRED - server refuses to
+                                                       start without it in prod)
+       GMAIL_USER            = your@gmail.com      (for email confirmations)
+       GMAIL_APP_PASS        = <16-char Gmail app password>  (free, enable 2FA -> app pass)
+       CLIENT_URL            = https://pulseroom.onrender.com
+       APP_URL               = https://pulseroom.onrender.com
+       VAPID_PUBLIC_KEY      = <paste the public key from data/.vapid.json>
+       VAPID_PRIVATE_KEY     = <paste the private key from data/.vapid.json>
+       PUSH_CONTACT_EMAIL    = admin@example.com
+     NOTE: JWT_SECRET and the VAPID keys MUST be env vars (not files), because
+     data/ is wiped on redeploys. Without fixed VAPID keys, every redeploy
+     invalidates all users' push subscriptions.
+
+------------------------------------------------------------------------------
+ 4. AFTER DEPLOY - CHECKLIST
+------------------------------------------------------------------------------
+  - Open https://pulseroom.onrender.com -> register -> confirm email.
+  - Register a second account (2nd browser/incognito) -> message each other
+    -> messages appear live on BOTH sides (proves Socket.IO works).
+  - Push a small git change -> wait for redeploy -> log in again with the SAME
+    account. It still exists = data persistence confirmed.
+  - Images/voice notes upload (proves multer upload path works).
+
+------------------------------------------------------------------------------
+ 5. FREE-TIER LIMITS TO EXPECT (not blockers)
+------------------------------------------------------------------------------
+  - Render free sleeps after ~15 min of inactivity. First load after sleep
+    takes 30-60s to wake (Socket.IO reconnects automatically). Everyone sees
+    this on free Render; it's normal.
+  - Render free = 512 MB RAM + ephemeral disk. Not a problem since the DB is
+    in Supabase.
+  - Uploads over ~4.5 MB may be limited by platform; fine for normal use.
+  - Supabase free is durable and does NOT wipe on deploy - that was the old
+    data/ problem and it is now gone.
+
+------------------------------------------------------------------------------
+ WHY THIS SOLVES "USERS LOSE ACCOUNTS ON EVERY DEPLOY"
+------------------------------------------------------------------------------
+  Accounts/rooms/messages are written to Supabase Postgres, which lives
+  outside Render. Redeploys only replace the code + temporary files on the
+  Render disk; the database is untouched. Logins, chats, and push all survive
+  every git push.
+
+------------------------------------------------------------------------------
+ FULL FEATURES AVAILABLE ON THIS SETUP (everything works)
+------------------------------------------------------------------------------
+  Real-time send/receive, typing, presence, read receipts, voice/video calls,
+  statuses + expiry job, E2EE, media uploads, star/edit/forward/delete, group
+  rooms + bridges, reports, block/privacy, scheduled messages, notifications.

@@ -76,10 +76,12 @@ export function SocketProvider({ children }) {
         replyToId,
         e2ee: Boolean(e2ee)
       });
+      // The sender's echo arrives via the socket's own 'new_message' event.
+      return null;
     } else if (token) {
       // REST HTTP Message Fallback when Socket.IO server is disconnected (e.g. Vercel Serverless environment)
       try {
-        await fetch('/api/messages', {
+        const res = await fetch('/api/messages', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -87,10 +89,20 @@ export function SocketProvider({ children }) {
           },
           body: JSON.stringify({ roomId, text, type: type || 'text', mediaUrl, replyToId, e2ee: Boolean(e2ee) })
         });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.error('REST sendMessage fallback failed:', errData.error || res.status);
+          return null;
+        }
+        // Return the created message so the caller can render the sender's own
+        // message (there is no socket echo to do it on a serverless deployment).
+        return await res.json();
       } catch (err) {
         console.error('HTTP REST sendMessage fallback error:', err);
+        return null;
       }
     }
+    return null;
   };
 
   const setTyping = (roomId, isTyping) => {

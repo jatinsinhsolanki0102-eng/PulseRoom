@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { X, Camera, User, Edit2, Sparkles, Check, ShieldCheck, Ban } from 'lucide-react';
+import { getSoundEnabled, setSoundEnabled } from '../../lib/notifications';
+import { X, Camera, User, Edit2, Sparkles, Check, ShieldCheck, Ban, Bell } from 'lucide-react';
 
 const PRIVACY_OPTIONS = ['everyone', 'contacts', 'nobody'];
 const PRIVACY_LABELS = { everyone: 'Everyone', contacts: 'My Contacts', nobody: 'Nobody' };
@@ -20,6 +21,7 @@ export default function ProfileModal({ isOpen, onClose }) {
   const [privacy, setPrivacy] = useState({ last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone' });
   const [blockedUsers, setBlockedUsers] = useState([]);
   const [privacyMsg, setPrivacyMsg] = useState('');
+  const [soundEnabled, setSoundEnabledState] = useState(getSoundEnabled());
 
   React.useEffect(() => {
     if (isOpen && user) {
@@ -28,6 +30,7 @@ export default function ProfileModal({ isOpen, onClose }) {
       setAvatarUrl(user.avatar_url || '');
       setError('');
       setSuccessMsg('');
+      setSoundEnabledState(getSoundEnabled());
       loadPrivacy();
       loadBlockedUsers();
     }
@@ -375,6 +378,41 @@ export default function ProfileModal({ isOpen, onClose }) {
               </div>
             ))}
           </div>
+        </div>
+
+        {/* Notification Settings */}
+        <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--panel-border)', paddingTop: '1.25rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.75rem' }}>
+            <Bell size={18} style={{ color: 'var(--primary-accent)' }} />
+            <h3 style={{ fontFamily: 'Outfit', fontWeight: '700', fontSize: '1rem', margin: 0, color: 'var(--text-main)' }}>
+              Notifications
+            </h3>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+            <span style={{ fontSize: '0.85rem', color: 'var(--text-main)', fontWeight: '600' }}>Notification Sound</span>
+            <button
+              onClick={() => {
+                const next = !soundEnabled;
+                setSoundEnabled(next);
+                setSoundEnabledState(next);
+              }}
+              className="chip-btn"
+              style={{
+                padding: '0.35rem 0.8rem',
+                borderRadius: '99px',
+                fontSize: '0.72rem',
+                background: soundEnabled ? 'var(--primary-accent)' : 'rgba(255,255,255,0.06)',
+                color: soundEnabled ? 'white' : 'var(--text-muted)',
+                fontWeight: '600'
+              }}
+            >
+              {soundEnabled ? 'On' : 'Off'}
+            </button>
+          </div>
+          <p style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '0.4rem' }}>
+            Plays a chime when a message arrives outside the open chat. Muted chats stay silent regardless.
+          </p>
         </div>
 
         {/* Blocked Users List */}

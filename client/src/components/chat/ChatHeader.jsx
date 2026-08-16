@@ -1,8 +1,9 @@
 import React from 'react';
 import { useSocket } from '../../context/SocketContext';
-import { Info, ArrowLeft, Lock } from 'lucide-react';
+import { Info, ArrowLeft, Lock, Search, Phone, Video, Image as ImageIcon } from 'lucide-react';
+import { formatLastSeen } from '../../lib/time';
 
-export default function ChatHeader({ room, onToggleInfo, onBack }) {
+export default function ChatHeader({ room, onToggleInfo, onBack, onSearch, onCall, onOpenGallery }) {
   const { onlineUsers } = useSocket();
 
   if (!room) return null;
@@ -14,7 +15,7 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
 
   return (
     <div className="chat-header">
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, minWidth: 0 }}>
         {/* Mobile Back Button */}
         {onBack && (
           <button
@@ -26,13 +27,13 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
           </button>
         )}
 
-        <div className="chat-header-info" onClick={onToggleInfo} style={{ cursor: 'pointer' }}>
-          <div className="avatar-wrapper" style={{ width: '42px', height: '42px' }}>
+        <div className="chat-header-info" onClick={onToggleInfo} style={{ cursor: 'pointer', minWidth: 0 }}>
+          <div className="avatar-wrapper" style={{ width: '42px', height: '42px', flexShrink: 0 }}>
             <img src={avatar || `https://api.dicebear.com/7.x/identicon/svg?seed=${name}`} alt={name} className="avatar-img" />
             {isPrivate && isOnline && <span className="online-dot" />}
           </div>
 
-          <div>
+          <div style={{ minWidth: 0 }}>
             <div className="chat-header-name">
               {name}
               <Lock
@@ -46,7 +47,9 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
                 isOnline ? (
                   <span>● Online</span>
                 ) : (
-                  <span style={{ color: 'var(--text-dim)' }}>Offline</span>
+                  <span style={{ color: 'var(--text-dim)' }}>
+                    {formatLastSeen(room.partner?.last_seen) || 'Offline'}
+                  </span>
                 )
               ) : (
                 <span style={{ color: 'var(--text-muted)' }}>
@@ -59,6 +62,26 @@ export default function ChatHeader({ room, onToggleInfo, onBack }) {
       </div>
 
       <div className="header-actions">
+        {onSearch && (
+          <button className="action-icon-btn" title="Search in this chat" onClick={onSearch}>
+            <Search size={18} />
+          </button>
+        )}
+        {onOpenGallery && (
+          <button className="action-icon-btn header-action-gallery" title="Media gallery" onClick={onOpenGallery}>
+            <ImageIcon size={18} />
+          </button>
+        )}
+        {isPrivate && onCall && (
+          <>
+            <button className="action-icon-btn header-action-call" title="Voice call" onClick={() => onCall('audio')}>
+              <Phone size={18} />
+            </button>
+            <button className="action-icon-btn header-action-call" title="Video call" onClick={() => onCall('video')}>
+              <Video size={18} />
+            </button>
+          </>
+        )}
         <button className="action-icon-btn" title="Chat Info & Details" onClick={onToggleInfo}>
           <Info size={18} />
         </button>

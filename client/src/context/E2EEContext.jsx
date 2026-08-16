@@ -10,7 +10,8 @@ import {
   decryptFromSender,
   initSenderKey,
   senderKeyEncrypt,
-  senderKeyDecrypt
+  senderKeyDecrypt,
+  advanceSenderKey
 } from '../crypto/e2ee';
 
 const E2EEContext = createContext();
@@ -35,6 +36,31 @@ function saveRoomState(userId, state) {
   }
 }
 
+// Persisted plaintext cache: messageId -> { envelope, text, mediaUrl, mediaKey,
+// mediaNonce, mime, type, c }. Once a message has been successfully decrypted,
+// its content survives reloads without re-deriving the sender-key chain - so a
+// deleted/expired/rotated link in the history can never make previously-readable
+// messages fail ("sent with a different encryption key"). `envelope` stores the
+// ciphertext fingerprint so an edit re-decrypts instead of serving stale text.
+const decryptedCacheName = (userId) => `pulseroom_decrypted_${userId}`;
+
+function loadDecryptedCache(userId) {
+  try {
+    const raw = localStorage.getItem(decryptedCacheName(userId));
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDecryptedCache(userId, cache) {
+  try {
+    localStorage.setItem(decryptedCacheName(userId), JSON.stringify(cache));
+  } catch (err) {
+    console.warn('E2EE decrypted cache save failed:', err.message);
+  }
+}
+
 export function E2EEProvider({ children }) {
   const { user, token } = useAuth();
   const { socket } = useSocket();
@@ -45,6 +71,14 @@ export function E2EEProvider({ children }) {
   const identityRef = useRef(null);
   identityRef.current = identity;
   const keyCacheRef = useRef(new Map());
+  const decryptedCacheRef = useRef({});
+
+  // Load this user's decrypted-message cache (per-account in localStorage).
+  useEffect(() => {
+    if (user?.id) {
+      decryptedCacheRef.current = loadDecryptedCache(user.id);
+    }
+  }, [user?.id]);
 
   // ---------- Ensure signed identity exists + upload ONLY public keys ----------
   // Each client keeps an ECDH identity key (for key agreement) and an ECDSA
@@ -340,7 +374,10 @@ export function E2EEProvider({ children }) {
   }, [ready, user, fetchRecipientKey, ensureGroupKey]);
 
   // ---------- Handle an incoming sender-key distribution message ----------
-  const handleSenderKeyMessage = useCallback(async (message, roomId) => {
+  // opts.force: reset/replace the stored chain even if this senderKeyId is
+  // already known. Used by decryptMessages to re-walk a drifted chain from its
+  // initial value so history that failed to authenticate can be recovered.
+  const handleSenderKeyMessage = useCallback(async (message, roomId, opts = {}) => {
     if (!user) return;
     let payload;
     try { payload = JSON.parse(message.text); } catch { return; }
@@ -360,7 +397,20 @@ export function E2EEProvider({ children }) {
       const { senderKeyId, senderKey: sk, chainKey } = JSON.parse(plain);
       const roomState = loadRoomState(user.id);
       if (!roomState[roomId]) roomState[roomId] = { my: null, others: {}, seenCounters: {} };
-      roomState[roomId].others[message.sender_id] = { senderKeyId, senderKey: sk, chainKey };
+      const existing = roomState[roomId].others?.[message.sender_id];
+      // If this distribution belongs to the key we already hold, leave the
+      // chain untouched. Re-processing the same key on a reload would rewind the
+      // already-advanced chain to its initial value and break every later message.
+      if (!opts.force && existing && existing.senderKeyId === senderKeyId) {
+        return;
+      }
+      roomState[roomId].others[message.sender_id] = {
+        senderKeyId,
+        senderKey: sk,
+        chainKey,
+        initChainKey: chainKey,
+        msgCount: 0
+      };
       // A fresh sender key restarts that sender's message counter, so reset the
       // replay counter for them - otherwise the first new-key messages would be
       // flagged as "replayed or duplicate" against the old counter value.
@@ -371,6 +421,69 @@ export function E2EEProvider({ children }) {
       console.warn('E2EE sender-key receive failed:', err.message);
     }
   }, [user, fetchRecipientKey]);
+
+  // ---------- Persist a successfully decrypted message (survives reloads) ----------
+  const cacheDecrypted = useCallback((message, inner) => {
+    if (!user || !message?.id || !inner) return;
+    const cache = decryptedCacheRef.current;
+    const key = String(message.id);
+    const envelope = message.text || '';
+    // Keep the newest plaintext for an id (e.g. an edit re-encrypts with a new
+    // envelope) but never overwrite an entry whose envelope still matches.
+    if (cache[key] && cache[key].envelope === envelope) return;
+    cache[key] = {
+      envelope,
+      text: inner.text ?? '',
+      mediaUrl: inner.mediaUrl ?? '',
+      mediaKey: inner.mediaKey ?? '',
+      mediaNonce: inner.mediaNonce ?? '',
+      mime: inner.mime ?? '',
+      type: inner.type ?? 'text',
+      c: typeof inner.c === 'number' ? inner.c : undefined
+    };
+    saveDecryptedCache(user.id, cache);
+  }, [user]);
+
+  // ---------- Decrypt a group message via the sender key (self-healing) ----------
+  // The sender-key chain only stays usable if EVERY message from a sender is
+  // decrypted exactly once, in order. A single skipped/double-decrypted message
+  // (e.g. two tabs sharing localStorage, or a reset decrypted-cache while the
+  // room state kept counting) leaves the receiver's chain out of sync and every
+  // later message fails AES-GCM authentication ("sent with a different
+  // encryption key"). This helper walks the chain forward against a throwaway
+  // copy until the message authenticates and then commits the corrected position.
+  const decryptGroupMessage = useCallback(async (roomId, senderId, payload) => {
+    const roomState = loadRoomState(user.id);
+    const senderState = roomState[roomId]?.others?.[senderId];
+    if (!senderState || senderState.senderKeyId !== payload.senderKeyId) {
+      return { ok: false, reason: 'missing_sender_key' };
+    }
+    try {
+      const res = await senderKeyDecrypt(senderState, payload.nonce, payload.cipher);
+      senderState.chainKey = res.nextChainKey;
+      senderState.msgCount = (senderState.msgCount || 0) + 1;
+      saveRoomState(user.id, roomState);
+      return { ok: true, plaintext: res.plaintext };
+    } catch (err) {
+      if (err.code === 'E2EE_AUTH_FAILED') {
+        // Walk the chain forward (we are likely BEHIND the sender by a few
+        // missed/double-processed messages) and commit the first matching spot.
+        let probe = { ...senderState };
+        for (let i = 0; i < 200; i++) {
+          probe.chainKey = await advanceSenderKey(probe.chainKey);
+          try {
+            const res = await senderKeyDecrypt(probe, payload.nonce, payload.cipher);
+            senderState.chainKey = probe.chainKey;
+            senderState.msgCount = (senderState.msgCount || 0) + i + 1;
+            saveRoomState(user.id, roomState);
+            return { ok: true, plaintext: res.plaintext };
+          } catch { /* keep walking */ }
+        }
+        return { ok: false, reason: 'auth' };
+      }
+      return { ok: false, reason: 'error' };
+    }
+  }, [user]);
 
   // ---------- Decrypt a message for display (with verification + replay checks) ----------
   // opts.maxSeen: when decrypting a batch of history in order, this is the running
@@ -384,6 +497,24 @@ export function E2EEProvider({ children }) {
     if (message.type === 'e2ee_sender_key') {
       await handleSenderKeyMessage(message, roomId);
       return { ...message, __system: 'sender_key' };
+    }
+
+    // Fast path: previously decrypted plaintext, so a reload never has to
+    // re-derive the sender-key chain (which a gap in history would break).
+    const cached = decryptedCacheRef.current[String(message.id)];
+    if (cached && cached.envelope === message.text) {
+      return {
+        ...message,
+        decryptedText: cached.text,
+        decryptedMediaUrl: cached.mediaUrl,
+        decryptedMediaKey: cached.mediaKey,
+        decryptedMediaNonce: cached.mediaNonce,
+        decryptedMime: cached.mime,
+        decryptedType: cached.type,
+        verified: true,
+        __counter: cached.c,
+        __fromCache: true
+      };
     }
 
     let payload;
@@ -401,6 +532,7 @@ export function E2EEProvider({ children }) {
           recipientId: payload.me.recipientId || user.id
         });
         const inner = JSON.parse(plain);
+        cacheDecrypted(message, inner);
         return {
           ...message,
           decryptedText: inner.text,
@@ -415,15 +547,15 @@ export function E2EEProvider({ children }) {
 
       let inner;
       if (payload.kind === 'msg' && payload.senderKeyId) {
-        const roomState = loadRoomState(user.id);
-        const sk = roomState[roomId]?.others?.[message.sender_id];
-        if (!sk || sk.senderKeyId !== payload.senderKeyId) {
-          return { ...message, __undecryptable: true, __reason: 'missing_sender_key' };
+        const r = await decryptGroupMessage(roomId, message.sender_id, payload);
+        if (!r.ok) {
+          return {
+            ...message,
+            __undecryptable: true,
+            __reason: r.reason === 'auth' ? 'auth' : 'missing_sender_key'
+          };
         }
-        const res = await senderKeyDecrypt(sk, payload.nonce, payload.cipher);
-        roomState[roomId].others[message.sender_id].chainKey = res.nextChainKey;
-        saveRoomState(user.id, roomState);
-        inner = JSON.parse(res.plaintext);
+        inner = JSON.parse(r.plaintext);
       } else if (payload.kind === 'msg' && identityRef.current) {
         const plain = await decryptFromSender({
           myPrivateJwk: identityRef.current.ecdh.privateJwk,
@@ -461,6 +593,7 @@ export function E2EEProvider({ children }) {
           roomState[roomId].seenCounters = { ...(roomState[roomId].seenCounters || {}), [message.sender_id]: inner.c };
           saveRoomState(user.id, roomState);
         }
+        cacheDecrypted(message, inner);
         return {
           ...message,
           decryptedText: inner.text,
@@ -474,6 +607,7 @@ export function E2EEProvider({ children }) {
         };
       }
 
+      cacheDecrypted(message, inner);
       return {
         ...message,
         decryptedText: inner.text,
@@ -492,7 +626,7 @@ export function E2EEProvider({ children }) {
         __reason: err.code === 'E2EE_AUTH_FAILED' ? 'auth' : 'error'
       };
     }
-  }, [user, handleSenderKeyMessage, fetchRecipientKey]);
+  }, [user, handleSenderKeyMessage, fetchRecipientKey, cacheDecrypted, decryptGroupMessage]);
 
   // ---------- Decrypt a list in order (sender-key dependencies preserved) ----------
   const decryptMessages = useCallback(async (messages, roomId) => {
@@ -502,9 +636,93 @@ export function E2EEProvider({ children }) {
       .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
     const running = {}; // sender_id -> highest counter decrypted in this batch
     const out = [];
+
+    const cache = decryptedCacheRef.current;
+    const parseEnvelope = (m) => { try { return JSON.parse(m.text); } catch { return null; } };
+
+    // Group the batch by sender: their sender-key distribution messages and their
+    // actual encrypted messages, plus which of the latter are still uncached.
+    const distsBySender = {};
+    const msgsBySender = {};
     for (const m of list) {
-      const d = await decryptMessage(m, roomId, { maxSeen: running[m.sender_id] || 0 });
-      if (typeof d.__counter === 'number') running[m.sender_id] = d.__counter;
+      if (!m || !m.e2ee) continue;
+      if (m.type === 'e2ee_sender_key') {
+        const p = parseEnvelope(m);
+        if (p?.kind === 'sender_key' && p.forMembers?.[user.id]) {
+          if (!distsBySender[m.sender_id]) distsBySender[m.sender_id] = [];
+          distsBySender[m.sender_id].push({ m, p });
+        }
+        continue;
+      }
+      if (!msgsBySender[m.sender_id]) msgsBySender[m.sender_id] = [];
+      msgsBySender[m.sender_id].push(m);
+    }
+
+    // A sender's chain must be re-walked from its initial value when (a) some of
+    // their messages here are NOT already decrypted (so the chain has to advance
+    // past them anyway) or (b) we hold no chain state for them at all (fresh
+    // device / cleared room state). Both cases need the distribution re-applied.
+    const rederive = {};
+    for (const sid of Object.keys(msgsBySender)) {
+      const dists = distsBySender[sid];
+      if (!dists || dists.length === 0) continue;
+      const anyUncached = msgsBySender[sid].some(
+        m => !cache[String(m.id)] || cache[String(m.id)].envelope !== m.text
+      );
+      const hasState = Boolean(loadRoomState(user.id)[roomId]?.others?.[sid]);
+      if (anyUncached || !hasState) rederive[sid] = true;
+    }
+
+    // Force-apply the LATEST distribution per re-derived sender (resets the chain
+    // to its initial value and clears that sender's replay counters). Old-key
+    // distributions are left alone - resetting to them would break newer messages.
+    const currentKeyId = {};
+    for (const sid of Object.keys(rederive)) {
+      const last = distsBySender[sid][distsBySender[sid].length - 1];
+      currentKeyId[sid] = last.p.senderKeyId;
+      await handleSenderKeyMessage(last.m, roomId, { force: true });
+    }
+
+    for (const m of list) {
+      // Distribution messages were applied above (or deliberately skipped when
+      // the chain is already in sync and fully cached) - never re-process here.
+      if (m.type === 'e2ee_sender_key') continue;
+
+      const sid = m.sender_id;
+      if (rederive[sid]) {
+        const cached = cache[String(m.id)];
+        if (cached && cached.envelope === m.text) {
+          // This message was decrypted before, but it was a REAL chain step, so
+          // the re-walk must advance the chain past it too. Only for messages of
+          // the CURRENT sender key - old-key messages sit before this chain.
+          const p = parseEnvelope(m);
+          if (p?.senderKeyId === currentKeyId[sid]) {
+            const roomState = loadRoomState(user.id);
+            const senderState = roomState[roomId]?.others?.[sid];
+            if (senderState) {
+              senderState.chainKey = await advanceSenderKey(senderState.chainKey);
+              senderState.msgCount = (senderState.msgCount || 0) + 1;
+              saveRoomState(user.id, roomState);
+            }
+          }
+          out.push({
+            ...m,
+            decryptedText: cached.text,
+            decryptedMediaUrl: cached.mediaUrl,
+            decryptedMediaKey: cached.mediaKey,
+            decryptedMediaNonce: cached.mediaNonce,
+            decryptedMime: cached.mime,
+            decryptedType: cached.type,
+            verified: true,
+            __counter: cached.c,
+            __fromCache: true
+          });
+          continue;
+        }
+      }
+
+      const d = await decryptMessage(m, roomId, { maxSeen: running[sid] || 0 });
+      if (typeof d.__counter === 'number') running[sid] = d.__counter;
       out.push(d);
     }
     // Persist the highest counters so live replay detection stays continuous.
@@ -526,7 +744,7 @@ export function E2EEProvider({ children }) {
       }
     }
     return out;
-  }, [decryptMessage, user]);
+  }, [decryptMessage, handleSenderKeyMessage, user]);
 
   // ---------- Regenerate my sender key on any group membership change ----------
   useEffect(() => {

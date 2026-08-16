@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useSocket } from '../../context/SocketContext';
-import { Plus, X, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Plus, X, Trash2, ChevronLeft, ChevronRight, Send } from 'lucide-react';
 
-export default function StatusTray({ onOpenCreateStatus }) {
+const QUICK_STATUS_EMOJIS = ['❤️', '👍', '😂', '🔥', '🎉', '😮'];
+
+export default function StatusTray({ onOpenCreateStatus, onReplyToStatus }) {
   const { token, user } = useAuth();
   const { socket } = useSocket();
   const [statuses, setStatuses] = useState([]);
@@ -23,6 +25,10 @@ export default function StatusTray({ onOpenCreateStatus }) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [progress, setProgress] = useState(0);
 
+  // Status reactions & replies
+  const [replyText, setReplyText] = useState('');
+  const [sendingReply, setSendingReply] = useState(false);
+
   const progressIntervalRef = useRef(null);
 
   useEffect(() => {
@@ -38,13 +44,19 @@ export default function StatusTray({ onOpenCreateStatus }) {
       setStatuses(prev => prev.filter(s => s.id !== statusId));
       setViewingQueue(prev => prev.filter(s => s.id !== statusId));
     };
+    const handleStatusReaction = ({ statusId, reactions }) => {
+      setStatuses(prev => prev.map(s => (s.id === statusId ? { ...s, reactions } : s)));
+      setViewingQueue(prev => prev.map(s => (s.id === statusId ? { ...s, reactions } : s)));
+    };
 
     socket.on('new_status', handleNewStatus);
     socket.on('status_deleted', handleStatusDeleted);
+    socket.on('status_reaction', handleStatusReaction);
 
     return () => {
       socket.off('new_status', handleNewStatus);
       socket.off('status_deleted', handleStatusDeleted);
+      socket.off('status_reaction', handleStatusReaction);
     };
   }, [socket]);
 
@@ -88,6 +100,53 @@ export default function StatusTray({ onOpenCreateStatus }) {
       }
     } catch (err) {
       console.error('Failed to delete status:', err);
+    }
+  };
+
+  // Toggle a reaction on the currently-viewed status
+  const toggleStatusReaction = async (emoji) => {
+    if (!activeStatus) return;
+    try {
+      const res = await fetch(`/api/statuses/${activeStatus.id}/reactions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ emoji })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setStatuses(prev => prev.map(s => (s.id === data.id ? { ...s, reactions: data.reactions } : s)));
+        setViewingQueue(prev => prev.map(s => (s.id === data.id ? { ...s, reactions: data.reactions } : s)));
+      }
+    } catch (err) {
+      console.error('Failed to react to status:', err);
+    }
+  };
+
+  // Reply to a status -> opens a DM with the author carrying the status quote
+  const submitStatusReply = async () => {
+    if (!activeStatus || !replyText.trim() || sendingReply) return;
+    setSendingReply(true);
+    try {
+      const res = await fetch(`/api/statuses/${activeStatus.id}/reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ reply: replyText.trim() })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const replyMessage = replyText.trim();
+        setReplyText('');
+        closeStoryViewer();
+        if (onReplyToStatus) onReplyToStatus(data.room, replyMessage);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Failed to send reply.');
+      }
+    } catch (err) {
+      console.error('Failed to reply to status:', err);
+      alert('Failed to send reply.');
+    } finally {
+      setSendingReply(false);
     }
   };
 
@@ -201,7 +260,7 @@ export default function StatusTray({ onOpenCreateStatus }) {
   };
 
   return (
-    <div style={{
+    <div className="status-tray" style={{
       padding: '0.75rem 1.25rem',
       borderBottom: '1px solid var(--panel-border)',
       background: 'rgba(0,0,0,0.15)'
@@ -234,7 +293,7 @@ export default function StatusTray({ onOpenCreateStatus }) {
       </div>
 
       {/* WhatsApp Status Circles Horizontal Tray */}
-      <div style={{ display: 'flex', gap: '0.85rem', overflowX: 'auto', paddingBottom: '0.25rem' }}>
+      <div className="status-tray-scroll" style={{ display: 'flex', gap: '0.85rem', overflowX: 'auto', paddingBottom: '0.25rem' }}>
         
         {/* WhatsApp My Status Circle */}
         <div
@@ -322,15 +381,18 @@ export default function StatusTray({ onOpenCreateStatus }) {
             onClick={(e) => e.stopPropagation()}
             style={{
               maxWidth: '400px',
-              height: '580px',
+              width: '100%',
+              height: 'min(580px, 82dvh)',
               background: activeStatus.bg_color || '#128c7e',
               display: 'flex',
               flexDirection: 'column',
               justifyContent: 'space-between',
               position: 'relative',
               borderRadius: '24px',
-              overflow: 'hidden',
-              userSelect: 'none'
+              overflowY: 'auto',
+              overflowX: 'hidden',
+              userSelect: 'none',
+              scrollbarWidth: 'thin'
             }}
           >
             {/* Top Multi-Segment WhatsApp Progress Bars */}
@@ -425,9 +487,9 @@ export default function StatusTray({ onOpenCreateStatus }) {
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '0 1rem', zIndex: 10 }}>
               {activeStatus.media_url ? (
                 activeStatus.media_type === 'video' ? (
-                  <video src={activeStatus.media_url} controls autoPlay style={{ width: '100%', maxHeight: '360px', objectFit: 'contain', borderRadius: '16px' }} />
+                  <video src={activeStatus.media_url} controls autoPlay style={{ width: '100%', maxHeight: 'min(360px, 38dvh)', objectFit: 'contain', borderRadius: '16px' }} />
                 ) : (
-                  <img src={activeStatus.media_url} alt="Story Media" style={{ width: '100%', maxHeight: '360px', objectFit: 'contain', borderRadius: '16px' }} />
+                  <img src={activeStatus.media_url} alt="Story Media" style={{ width: '100%', maxHeight: 'min(360px, 38dvh)', objectFit: 'contain', borderRadius: '16px' }} />
                 )
               ) : null}
 
@@ -437,6 +499,104 @@ export default function StatusTray({ onOpenCreateStatus }) {
                 </div>
               )}
             </div>
+
+            {/* Status Reactions Display */}
+            {activeStatus.reactions && Object.keys(activeStatus.reactions).length > 0 && (
+              <div style={{ display: 'flex', justifyContent: 'center', flexWrap: 'wrap', gap: '0.4rem', zIndex: 20, padding: '0 16px 4px' }}>
+                {Object.entries(activeStatus.reactions).map(([emoji, userIds]) => (
+                  <button
+                    key={emoji}
+                    onClick={() => toggleStatusReaction(emoji)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      background: (userIds || []).includes(user?.id) ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.25)',
+                      border: (userIds || []).includes(user?.id) ? '1.5px solid #ffffff' : '1px solid rgba(255,255,255,0.45)',
+                      borderRadius: '99px',
+                      padding: '0.25rem 0.7rem',
+                      color: 'white',
+                      cursor: 'pointer',
+                      fontSize: '0.85rem'
+                    }}
+                  >
+                    <span>{emoji}</span>
+                    <span style={{ fontWeight: '700' }}>{userIds.length}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Status Quick Reaction Bar */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem', zIndex: 20, padding: '8px 16px 6px' }}>
+              {QUICK_STATUS_EMOJIS.map(emoji => (
+                <button
+                  key={emoji}
+                  onClick={() => toggleStatusReaction(emoji)}
+                  title="React to status"
+                  style={{
+                    background: 'rgba(0,0,0,0.25)',
+                    border: 'none',
+                    borderRadius: '50%',
+                    width: '34px',
+                    height: '34px',
+                    fontSize: '1.05rem',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    transition: 'transform 0.15s ease'
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.transform = 'scale(1.15)'}
+                  onMouseLeave={(e) => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+
+            {/* Status Reply Box (only for others' statuses) */}
+            {activeStatus.user_id !== user?.id && (
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', padding: '0 16px 10px', zIndex: 20 }}>
+                <input
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && submitStatusReply()}
+                  placeholder="Reply to this status..."
+                  style={{
+                    flex: 1,
+                    background: 'rgba(0,0,0,0.3)',
+                    border: '1px solid rgba(255,255,255,0.45)',
+                    borderRadius: '99px',
+                    padding: '0.5rem 0.9rem',
+                    color: 'white',
+                    outline: 'none',
+                    fontSize: '0.85rem'
+                  }}
+                />
+                <button
+                  onClick={submitStatusReply}
+                  disabled={!replyText.trim() || sendingReply}
+                  title="Send reply"
+                  style={{
+                    background: 'linear-gradient(135deg, #10b981, #06b6d4)',
+                    border: 'none',
+                    borderRadius: '99px',
+                    color: 'white',
+                    width: '38px',
+                    height: '38px',
+                    flexShrink: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: replyText.trim() && !sendingReply ? 'pointer' : 'not-allowed',
+                    opacity: replyText.trim() && !sendingReply ? 1 : 0.5
+                  }}
+                >
+                  <Send size={16} />
+                </button>
+              </div>
+            )}
 
             {/* Bottom Footer Navigator Controls */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', zIndex: 20, background: 'rgba(0,0,0,0.15)' }}>

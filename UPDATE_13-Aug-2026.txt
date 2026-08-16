@@ -1,0 +1,405 @@
+================================================================================
+ PULSEROOM - DAILY UPDATE
+ Date: 13-Aug-2026
+================================================================================
+
+----------------------------------------------------------------------
+ 1. BUG FIX - GROUP CHAT MESSAGES SHOWING "SENT WITH A DIFFERENT
+    ENCRYPTION KEY" AFTER PAGE RELOAD (F5)
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  After reloading the page, messages that displayed fine before the reload
+  started showing the error "This message can't be displayed because it was
+  sent with a different encryption key."
+
+Root cause:
+  Group chat messages use a chain ratchet (sender-key). On reload, the whole
+  history was re-decrypted by re-deriving the sender-key chain. If the chain
+  state in the browser no longer matched the history (a deleted, expired, or
+  rotated key, an identity mismatch, or an out-of-order message), every
+  message after the broken link failed to authenticate - and the broken chain
+  was also saved back, permanently corrupting future messages.
+
+Fix applied (client/src/context/E2EEContext.jsx):
+  - Added a per-user decrypted plaintext cache in localStorage. Once a
+    message is successfully decrypted, it is rendered from the cache on every
+    reload, so it never depends on re-deriving the chain again.
+  - handleSenderKeyMessage no longer rewinds the chain when the same key is
+    already held.
+  - decryptMessages skips sender-key re-processing for senders whose history
+    is already fully decrypted (cached).
+  - An envelope fingerprint ensures edited messages still re-decrypt instead
+    of showing stale text.
+
+----------------------------------------------------------------------
+ 2. BUG FIX - CALL DOES NOT END ON THE OTHER SIDE WHEN ONE SIDE
+    HANGS UP
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  During a voice/video call, when one side pressed "end call", that side's
+  call ended successfully but the other side's call UI stayed active forever.
+
+Root cause:
+  The call object stored in callRef.current never had a "mode" field set.
+  The hangup() function checked callRef.current.mode to decide whether to
+  notify the peer, but it was always undefined - so it silently ended the
+  local call WITHOUT sending the call_end/call_cancel event to the server.
+  The peer therefore never received the call_ended signal.
+
+Fix applied (client/src/context/CallContext.jsx):
+  - callRef.current.mode is now set at every call transition:
+      * 'outgoing'  -> when starting a call
+      * 'incoming'  -> when receiving a call
+      * 'active'    -> on accept, on answer, and when the connection opens
+  - hangup() now correctly emits 'call_end' (active call) or 'call_cancel'
+    (ringing call), which the server relays to the other side.
+
+----------------------------------------------------------------------
+ 3. FEATURE - STATUS REACTIONS & REPLIES (FEATURE_LIST SECTION 6)
+----------------------------------------------------------------------
+Status: DONE
+
+Implemented:
+  - Status reactions: users can react to a WhatsApp-style status story with
+    emojis. Reactions are stored as a JSONB column on user_statuses and are
+    broadcast live to everyone viewing the story.
+      * server/src/db.js        -> toggleStatusReaction (PostgreSQL + memory)
+      * server/src/server.js    -> POST /api/statuses/:statusId/reactions
+      * client StatusTray.jsx   -> reaction pills + quick emoji reaction bar
+  - Status replies: users can reply to a status, which opens (or reuses) a
+    private room and delivers a special "status reply" message to the author.
+      * server/src/db.js        -> createStatusReply
+      * server/src/server.js    -> POST /api/statuses/:statusId/reply
+      * MessageBubble.jsx       -> green "Status reply" quote card rendering
+      * Sidebar/App threading   -> auto-open the DM when replying
+  - Status expiration: stories automatically expire 24 hours after creation.
+      * server/src/db.js        -> deleteExpiredStatuses
+      * server/src/server.js    -> cleanup job on boot + every 30 minutes,
+                                   emits status_deleted per expired story
+  - Fixed bug: GET /api/statuses previously called the non-existent
+    db.getStatuses(); now uses db.getAllActiveStatuses().
+  - Vercel serverless parity updated in api/index.js (reactions, reply,
+    and 24h expiry filtering).
+
+----------------------------------------------------------------------
+ 4. FEATURE - RESPONSIVE DEVICE ADAPTATION & SCROLLING
+----------------------------------------------------------------------
+Status: DONE
+
+Implemented:
+  - The app now adapts its layout to the device/window width:
+      * Desktop (>1100px)      -> full two-pane layout
+      * Tablet (769-1100px)    -> sidebar & chat-info drawer narrow to 300px
+      * Mobile (<=768px)       -> one pane at a time (sidebar <-> chat),
+                                  chat info becomes a full-screen sheet,
+                                  quick-reply chips scroll horizontally
+      * Small phones (<=400px) -> compact 34px icon buttons, secondary header
+                                  actions hidden, compact brand/avatars
+      * Ultra-narrow (<=360px) -> wordmark hidden, logo only
+  - Scrolling fixes across the app:
+      * ChatInfoDrawer ("i" button) had NO scroll on desktop - content taller
+        than the window was clipped. Added overflow-y: auto so the whole
+        drawer scrolls when needed.
+      * Status story viewer was overflow:hidden at a fixed height - the
+        bottom sections (reactions, reply box, footer) got cut off. It now
+        scrolls vertically and media is capped at min(360px, 38dvh) so the
+        controls stay reachable on short screens.
+      * Thin custom scrollbars added for the room list, message feed and
+        status circle tray; status tray circles use a clean horizontal scroll.
+  - Story viewer height is now min(580px, 82dvh) so it fits small phones.
+  - Chat header names now truncate instead of overflowing.
+
+----------------------------------------------------------------------
+ 5. BUG FIX - EMOJI BUTTON IN THE COMPOSER DID NOTHING
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  Pressing the smiley (emoji) button next to the message input produced no
+  response - no emoji picker ever appeared.
+
+Root cause:
+  ChatComposer toggled a showEmojiDrawer state flag on click, but nothing in
+  the component rendered that flag. The emoji picker simply did not exist.
+
+Fix applied (client/src/components/composer/):
+  - Created a new EmojiPicker component with a categorized, scrollable grid
+    (~380 emojis across Smileys, Gestures, Hearts, Animals, Food, Activity,
+    Travel, and Symbols).
+  - ChatComposer now renders the picker above the message bar when toggled.
+  - Clicking an emoji inserts it at the cursor position in the input and
+    closes the picker; clicking outside (backdrop) closes it too.
+
+----------------------------------------------------------------------
+ 6. FEATURE - NOTIFICATION SOUND, UNREAD BADGES, PER-CHAT MUTE &
+    DEEP-LINKING (FEATURE_LIST SECTION 8)
+----------------------------------------------------------------------
+Status: DONE
+
+Implemented:
+  - Unread badge counts per chat:
+      * Server GET /api/rooms already returned unread_count (messages not in
+        your read_by list); it is now consumed end-to-end.
+      * client/src/App.jsx tracks per-room counts, zeroing the badge when a
+        chat is opened (handleRoomsSynced + markRoomRead).
+      * Sidebar.jsx renders a unread-badge pill on every chat row.
+      * Total unread drives the document title "(3) PulseRoom" and the PWA
+        app badge (navigator.setAppBadge) when available.
+  - Notification sound (no audio file needed):
+      * New client/src/lib/notifications.js plays a WhatsApp-style two-note
+        chime via the Web Audio API. Enabled by default; respects muted chats.
+      * ProfileModal (camera icon -> profile) has an On/Off toggle persisted
+        in localStorage (pulseroom_sound_enabled).
+  - Mute per-chat notifications:
+      * ChatInfoDrawer ("i" panel) has a Mute / Unmute chip button.
+      * Server: db.toggleMuteRoom persists mutes per-user in
+        theme_preferences.muted_rooms (PostgreSQL) and memoryDb.muted_chats
+        (memory mode), exactly like pinned chats.
+      * Server: push.js skips push notifications for members who muted the
+        room (live messages are still delivered).
+      * GET /api/rooms now returns is_muted per room; Sidebar shows a BellOff
+        icon on muted chats.
+      * New PUT /api/rooms/:roomId/mute route (server.js + api/index.js).
+  - Deep-link / open specific room from a notification:
+      * sw.js notificationclick now focuses the existing window and posts
+        OPEN_ROOM (with roomId) to it, or opens /?room=<roomId>.
+      * App.jsx listens for the service-worker message and parses ?room= on
+        load, fetching the room list and opening that chat (messages load
+        automatically).
+
+----------------------------------------------------------------------
+ 7. BUG FIX - SENT MESSAGES NOT VISIBLE TO THE SENDER
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  After sending a message it never appeared in the sender's chat - but the
+  receiver saw it fine.
+
+Root cause:
+  The server always broadcasts the saved message back to every member
+  (sender included) over their user:<id> socket channel. App.jsx's
+  handleNewMessage had an early exit - `if (msg.sender_id === user?.id)
+  return;` - that discarded the sender's own echo, and ChatComposer had no
+  optimistic insert, so the sender's own message never rendered.
+
+Fix applied (client/src/App.jsx):
+  - handleNewMessage no longer skips the sender's own echoed message. It now
+    flows through the normal decrypt-and-append path (the E2EE layer already
+    supports reading back your own messages via the embedded self-copy).
+  - Own echoes still do NOT increment unread badges, do NOT play the
+    notification sound, and do NOT trigger markRead.
+
+----------------------------------------------------------------------
+ 8. UI FIX - CHAT INFO ("i") ACTION BUTTONS SCROLL HORIZONTALLY
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  The Pin / Mute / Block / Add Members / Clear / Delete chip buttons in the
+  chat info drawer got cut off on narrow screens - actions at the end were
+  unreachable.
+
+Fix applied (client/src/components/chat/ChatInfoDrawer.jsx):
+  - The action chip row now scrolls horizontally (overflow-x: auto, nowrap,
+    touch scrolling) instead of overflowing.
+  - Each chip has flex: 0 0 auto + white-space: nowrap so buttons keep their
+    full size and the row scrolls smoothly.
+  - Added a slim styled scrollbar (Firefox + webkit) in index.css
+    (.chip-action-row).
+
+===============================================================================
+ PULSEROOM - DAILY UPDATE
+ Date: 15-Aug-2026
+===============================================================================
+
+----------------------------------------------------------------------
+ 1. FEATURE - GROUP ADMIN ROLES: PROMOTE / DEMOTE, REMOVE MEMBER,
+    LEAVE GROUP (FEATURE_LIST SECTION 10)
+----------------------------------------------------------------------
+Status: DONE
+
+Implemented:
+  - Backend (server/src/server.js):
+      * Added an admin-only guard to POST /api/rooms/:roomId/members
+        (add members) - non-admins get 403 "Only group admins can add
+        members." Uses the new db.getRoomById + existing
+        db.getRoomMemberRole.
+      * Promote/demote (PUT .../members/:userId/role), remove member
+        (DELETE .../members/:userId) and leave group
+        (POST /api/rooms/:roomId/leave) routes already existed; verified
+        they cannot remove/demote the last admin (the group can never end
+        up admin-less).
+  - server/src/db.js: added getRoomById (PostgreSQL + memory mode).
+  - client ChatInfoDrawer.jsx: member roster now shows an Admin badge per
+    admin. Group admins get per-member controls - promote/demote
+    (ShieldCheck/ShieldOff) and remove (UserX). A "Leave Group" button is
+    available to every member. "Add Members" and "Edit Group Info" are
+    admin-only.
+  - client App.jsx: refreshActiveRoom re-fetches /api/rooms after admin
+    actions so members/roles/metadata stay fresh. New socket handlers for
+    room_updated, group_role_updated, removed_from_room, left_room and
+    room_deleted. Fixed handleRoomMembersUpdated which used to clobber the
+    active room with a minimal `{ id }` payload after admin actions - it now
+    refreshes from the server instead.
+
+----------------------------------------------------------------------
+ 2. FEATURE - GROUP EDIT: RENAME / PHOTO / DESCRIPTION
+    (FEATURE_LIST SECTION 10)
+----------------------------------------------------------------------
+Status: DONE
+
+Implemented:
+  - New client/src/components/groups/EditGroupModal.jsx: rename the group,
+    change its photo (image upload via FormData to PUT /api/rooms/:roomId,
+    with live preview) and edit the description.
+  - Opened from the "Edit Group Info" button in the chat info drawer
+    (group admins only). The update is broadcast via the room_updated
+    socket event so all members see it live.
+
+----------------------------------------------------------------------
+ 3. BUG FIX - APP CRASH "SOMETHING WENT WRONG" ON EVERY LOAD
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  After the group admin/group edit work, the app showed the error
+  boundary ("Something went wrong - A UI rendering error occurred") on
+  every page load and was completely unusable.
+
+Root cause:
+  client/src/App.jsx: the socket useEffect listed refreshActiveRoom in its
+  dependency array, but the useCallback was declared AFTER that effect.
+  React evaluates the deps array during render (top to bottom), and reading
+  the const before its declaration threw a TDZ ReferenceError
+  ("Cannot access 'refreshActiveRoom' before initialization") on every
+  render, which the ErrorBoundary caught.
+
+Fix applied (client/src/App.jsx):
+  - Moved the refreshActiveRoom useCallback above the socket useEffect that
+    depends on it. Verified with a headless browser that the error screen no
+    longer appears and the login UI renders.
+
+----------------------------------------------------------------------
+ 4. BUG FIX - LOGIN FAILING WITH "FAILED TO FETCH"
+----------------------------------------------------------------------
+Status: FIXED
+
+Problem:
+  Signing in reported "Failed to fetch" even though the backend was up.
+
+Causes & fixes:
+  - The vite dev server serving the client (port 3000) was stopped, so the
+    browser's fetch('/api/...') hit a dead server -> network-level
+    "Failed to fetch". Restarted the dev server.
+  - CORS also rejected requests whose Origin was http://127.0.0.1:3000
+    (only http://localhost:3000 was allowed), so opening the app via the IP
+    failed on the CORS preflight. Added http://127.0.0.1:3000 to CLIENT_URL
+    in server/.env and restarted the backend. Verified both origins now
+    reach the API.
+
+------------------------------------------------------------------------------
+ 5. FEATURE - api/index.js (VERCEL) FULL ROUTE PARITY WITH SERVER + SOCKETS
+    (FEATURE_LIST SECTION 10 - D1/D2 GAP)
+------------------------------------------------------------------------------
+Status: DONE
+
+Implemented (api/index.js):
+  - Account: DELETE /api/users (own account only), GET/PUT /api/users/privacy,
+    POST/DELETE /api/users/:userId/block, GET /api/users/blocked.
+  - Push: GET /api/push/vapid-public-key (generated P-256 key or VAPID_PUBLIC_KEY
+    env), POST /api/push/subscribe.
+  - Messages: PUT /api/messages/:messageId (edit, sender-only),
+    POST /api/messages/:messageId/star + GET /api/rooms/:roomId/starred,
+    GET /api/rooms/:roomId/search, POST /api/messages/:messageId/delete-everyone,
+    POST /api/messages/:messageId/report (rate limited),
+    POST /api/messages/forward (membership + block enforced per target).
+  - Rooms: GET /api/rooms/bridges, PUT /api/rooms/:roomId/disappearing
+    (whitelist 0/86400/604800/7776000), PUT/DELETE /api/rooms/:roomId/members/
+    :userId/role (admin only), POST /api/rooms/:roomId/leave (empty group
+    dissolved, last admin auto-promotes), PUT /api/rooms/:roomId (admin group
+    edit with avatar upload).
+  - Multipart upload parity: PUT /api/users/profile, POST /api/rooms/group,
+    POST /api/messages, POST /api/statuses, PUT /api/rooms/:roomId all accept
+    file uploads and store as data: URLs (serverless-safe).
+  - Business rules mirrored from server.js: self-chat/blocked guards on private
+    rooms and 1:1 sends, admin-only add-members/role/remove/group-edit, group
+    creator seeded as admin.
+
+Sockets (client):
+  - SocketContext.sendMessage() now falls back to POST /api/messages when the
+    socket is missing/disconnected and returns the created message.
+  - ChatComposer surfaces it via a new onMessageDelivered prop; App.jsx
+    handleRestDeliveredMessage decrypts + appends the sender's own message so
+    sends are visible on serverless without a socket echo.
+
+Verification:
+  - node --check api/index.js passes; client production build passes;
+    server test suite 10/10 passes.
+  - 37-assertion HTTP smoke test against the serverless app covers every new
+    route and guard (37/37 pass).
+
+CONFIRMED COMPLETE (15-Aug-2026):
+  FEATURE_LIST.txt section 10 item "api/index.js (Vercel) parity with server
+  routes + sockets (D1/D2 gap)" is complete and workable. PROJECT_ISSUES.txt
+  D1/D2 and AUDIT_VERIFICATION.txt D1/D2/D4 marked RESOLVED.
+
+================================================================================
+ PULSEROOM - DAILY UPDATE
+ Date: 16-Aug-2026
+================================================================================
+
+----------------------------------------------------------------------
+ 1. FEATURE - MODERATION DASHBOARD FOR REPORTED MESSAGES
+    (FEATURE_LIST SECTION 10 - admin only)
+----------------------------------------------------------------------
+Status: DONE
+  - Admin-only moderation dashboard: only moderators (MODERATOR_EMAILS in
+    server/.env) see the "Moderation Dashboard" entry and can resolve/dismiss
+    reports. Resolve/Dismiss bug (PostgreSQL "$2 data type" error) fixed by
+    renumbering query placeholders. Verified against the live database.
+
+----------------------------------------------------------------------
+ 2. FEATURE - "LAST SEEN 5 MIN AGO" FORMATTED TIMESTAMPS
+----------------------------------------------------------------------
+Status: DONE
+  - New client/src/lib/time.js (formatLastSeen / formatRelativeTime) used in
+    ChatHeader (offline DMs) and the Sidebar directory list.
+
+----------------------------------------------------------------------
+ 3. UI - SIDEBAR HEADER CONSOLIDATED INTO A HAMBURGER MENU
+----------------------------------------------------------------------
+Status: DONE
+  - The six header buttons (profile, invite, theme studio, new group,
+    moderation, sign out) were replaced by a single Menu button with a
+    dropdown; closes on outside click / Escape.
+
+----------------------------------------------------------------------
+ 4. BUG FIX - GROUP MESSAGES "SENT WITH A DIFFERENT ENCRYPTION KEY"
+    (SENDER-KEY CHAIN DESYNC - SELF-HEALING E2EE)
+----------------------------------------------------------------------
+Status: FIXED
+  - Root cause: a group sender-key chain only works if every message is
+    decrypted exactly once, in order; a skipped/double-decrypted message
+    (two tabs sharing storage, reset cache) drifted the chain permanently.
+  - Fix: e2ee.js advanceSenderKey(); E2EEContext forward-walk recovery on
+    auth failure + batch re-derive on history load; App.jsx auto-refetches
+    history when a live group message fails to decrypt. 27/27 client tests.
+
+----------------------------------------------------------------------
+ 5. FEATURE - PWA INSTALLABLE + OFFLINE CACHE
+    (FEATURE_LIST SECTION 10)
+----------------------------------------------------------------------
+Status: DONE
+  - Web app manifest (standalone, theme colors, 192/512 + maskable icons).
+  - Custom "Install App" button (beforeinstallprompt) in the sidebar menu.
+  - Service worker offline cache: cached app shell + assets, network-first
+    navigations with offline fallback, live API/media never cached.
+
+================================================================================
+ END OF UPDATE
+================================================================================

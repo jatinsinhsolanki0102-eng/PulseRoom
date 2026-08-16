@@ -43,6 +43,13 @@ const globalMessages = global._pulseroom_messages || new Map();
 const globalStatuses = global._pulseroom_statuses || new Map();
 const globalPendingInvites = global._pulseroom_pending_invites || new Map();
 const globalE2EEKeys = global._pulseroom_e2ee_keys || new Map();
+const globalMutedRooms = global._pulseroom_muted_rooms || new Map(); // roomId -> [userId]
+const globalArchivedRooms = global._pulseroom_archived_rooms || new Map(); // roomId -> [userId]
+const globalUnreadRooms = global._pulseroom_unread_rooms || new Map(); // roomId -> [userId]
+const globalBlocked = global._pulseroom_blocked || new Map(); // userId -> [blockedUserId]
+const globalBridges = global._pulseroom_bridges || new Map(); // bridgeId -> bridge
+const globalPushSubs = global._pulseroom_push_subs || new Map(); // userId -> [subscription]
+const globalReports = global._pulseroom_reports || new Map(); // reportId -> report
 
 global._pulseroom_users = globalUsers;
 global._pulseroom_confirmed = globalConfirmedEmails;
@@ -52,6 +59,13 @@ global._pulseroom_messages = globalMessages;
 global._pulseroom_statuses = globalStatuses;
 global._pulseroom_pending_invites = globalPendingInvites;
 global._pulseroom_e2ee_keys = globalE2EEKeys;
+global._pulseroom_muted_rooms = globalMutedRooms;
+global._pulseroom_archived_rooms = globalArchivedRooms;
+global._pulseroom_unread_rooms = globalUnreadRooms;
+global._pulseroom_blocked = globalBlocked;
+global._pulseroom_bridges = globalBridges;
+global._pulseroom_push_subs = globalPushSubs;
+global._pulseroom_reports = globalReports;
 
 function getSupabaseHeaders() {
   const key = getSupabaseAnonKey();
@@ -150,6 +164,84 @@ async function findUserById(id) {
   }
 
   return globalUsers.get(id) || null;
+}
+
+// ---------- Shared room / message helpers (mirror server/src/db.js) ----------
+
+// Search every room's message list for a message by id
+function findMessageById(messageId) {
+  for (const msgs of globalMessages.values()) {
+    const m = msgs.find(x => x.id === messageId);
+    if (m) return m;
+  }
+  return null;
+}
+
+function getRoomMemberIds(roomId) {
+  const room = globalRooms.get(roomId);
+  return room && Array.isArray(room.members) ? room.members.map(m => m.id) : [];
+}
+
+function isRoomMember(roomId, userId) {
+  return getRoomMemberIds(roomId).includes(userId);
+}
+
+function getRoomMemberRole(roomId, userId) {
+  const room = globalRooms.get(roomId);
+  if (!room || !Array.isArray(room.members)) return null;
+  const member = room.members.find(m => String(m.id) === String(userId));
+  if (!member) return null;
+  // Private rooms: everyone is treated as a full member.
+  return member.role || (room.type === 'group' ? 'member' : 'admin');
+}
+
+function setRoomMemberRole(roomId, userId, role) {
+  const room = globalRooms.get(roomId);
+  if (!room || !Array.isArray(room.members)) return null;
+  const member = room.members.find(m => String(m.id) === String(userId));
+  if (!member) return null;
+  member.role = role;
+  return { room_id: roomId, user_id: userId, role };
+}
+
+function removeRoomMember(roomId, userId) {
+  const room = globalRooms.get(roomId);
+  if (!room || !Array.isArray(room.members)) return null;
+  const before = room.members.length;
+  room.members = room.members.filter(m => String(m.id) !== String(userId));
+  if (room.members.length !== before) return { user_id: userId };
+  return null;
+}
+
+async function isBlockedBetween(userAId, userBId) {
+  if (!userAId || !userBId) return false;
+  const a = globalBlocked.get(userAId) || [];
+  const b = globalBlocked.get(userBId) || [];
+  return a.includes(userBId) || b.includes(userAId);
+}
+
+// VAPID public key for web push. On serverless the keypair cannot be persisted,
+// so prefer env VAPID_PUBLIC_KEY; otherwise generate a fresh P-256 key once per
+// instance (the key is only used for subscriptions, not delivery).
+let _vapidPublicKeyCache = null;
+function getVapidPublicKey() {
+  if (_vapidPublicKeyCache) return _vapidPublicKeyCache;
+  if (process.env.VAPID_PUBLIC_KEY) {
+    _vapidPublicKeyCache = process.env.VAPID_PUBLIC_KEY;
+    return _vapidPublicKeyCache;
+  }
+  try {
+    const { publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const jwk = publicKey.export({ format: 'jwk' });
+    _vapidPublicKeyCache = Buffer.concat([
+      Buffer.from([0x04]),
+      Buffer.from(jwk.x, 'base64url'),
+      Buffer.from(jwk.y, 'base64url')
+    ]).toString('base64url');
+  } catch (e) {
+    _vapidPublicKeyCache = '';
+  }
+  return _vapidPublicKeyCache;
 }
 
 async function createUser({ username, email, passwordHash, avatarUrl, bio, emailConfirmed = false }) {
@@ -585,6 +677,7 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name:
     globalConfirmedEmails.add(cleanEmail);
 
     const { password_hash, ...safeUser } = user;
+    safeUser.is_moderator = isModerator(safeUser);
     const token = jwt.sign(
       { id: safeUser.id, username: safeUser.username, email: safeUser.email },
       getJwtSecret(),
@@ -628,13 +721,14 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: 'Account not found. Please sign up again.' });
     }
     const { password_hash, ...safe } = user;
+    safe.is_moderator = isModerator(safe);
     return res.json(safe);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch user profile.' });
   }
 });
 
-app.put('/api/users/profile', authenticateToken, async (req, res) => {
+app.put('/api/users/profile', authenticateToken, upload.single('avatar'), async (req, res) => {
   try {
     const { username, avatarUrl, bio } = req.body || {};
     let user = await findUserById(req.user.id);
@@ -643,7 +737,11 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
     }
 
     if (username) user.username = username.trim();
-    if (avatarUrl) user.avatar_url = avatarUrl;
+    if (req.file) {
+      user.avatar_url = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    } else if (avatarUrl) {
+      user.avatar_url = avatarUrl;
+    }
     if (bio !== undefined) user.bio = bio.trim();
 
     globalUsers.set(user.id, user);
@@ -675,6 +773,164 @@ app.put('/api/users/theme', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete a user account - restricted to the authenticated user's OWN account
+app.delete('/api/users', authenticateToken, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Email address is required.' });
+
+    if (email.trim().toLowerCase() !== (req.user.email || '').trim().toLowerCase()) {
+      return res.status(403).json({ error: 'You can only delete your own account.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const removed = await findUserByEmail(cleanEmail);
+    if (!removed) return res.status(404).json({ error: 'No user found with that email address.' });
+
+    globalUsers.delete(removed.id);
+    globalAccountStore.delete(cleanEmail);
+    globalBlocked.delete(removed.id);
+    for (const [blockerId, list] of globalBlocked.entries()) {
+      globalBlocked.set(blockerId, list.filter(id => id !== removed.id));
+    }
+    for (const [roomId, room] of globalRooms.entries()) {
+      room.members = (room.members || []).filter(m => String(m.id) !== String(removed.id));
+      if (room.members.length === 0) globalRooms.delete(roomId);
+    }
+    for (const msg of findMessagesBySender(removed.id).values()) {
+      const arr = globalMessages.get(msg.room_id);
+      if (arr) {
+        const idx = arr.indexOf(msg);
+        if (idx >= 0) arr.splice(idx, 1);
+      }
+    }
+    for (const [id, st] of globalStatuses.entries()) {
+      if (String(st.user_id) === String(removed.id)) globalStatuses.delete(id);
+    }
+    for (const [inviteeEmail, ids] of globalPendingInvites.entries()) {
+      const filtered = ids.filter(id => id !== removed.id);
+      if (filtered.length === 0) globalPendingInvites.delete(inviteeEmail);
+      else globalPendingInvites.set(inviteeEmail, filtered);
+    }
+
+    return res.json({ message: `User ${removed.username} (${removed.email}) deleted.` });
+  } catch (err) {
+    console.error('Delete User Error:', err);
+    return res.status(500).json({ error: 'Failed to delete user.' });
+  }
+});
+
+function findMessagesBySender(senderId) {
+  const map = new Map();
+  for (const msgs of globalMessages.values()) {
+    for (const m of msgs) {
+      if (String(m.sender_id) === String(senderId)) map.set(m.id, m);
+    }
+  }
+  return map;
+}
+
+// 6b. Privacy: read/update last-seen visibility, profile photo & status visibility
+app.get('/api/users/privacy', authenticateToken, async (req, res) => {
+  try {
+    const user = await findUserById(req.user.id);
+    return res.json((user && user.privacy_preferences) || { last_seen: 'everyone', profile_photo: 'everyone', status: 'everyone' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch privacy preferences.' });
+  }
+});
+
+app.put('/api/users/privacy', authenticateToken, async (req, res) => {
+  try {
+    const { last_seen, profile_photo, status } = req.body || {};
+    const user = await findUserById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'Account not found.' });
+    user.privacy_preferences = {
+      ...(user.privacy_preferences || {}),
+      last_seen: last_seen || 'everyone',
+      profile_photo: profile_photo || 'everyone',
+      status: status || 'everyone'
+    };
+    globalUsers.set(user.id, user);
+    if (user.email) globalAccountStore.set(user.email.toLowerCase(), user);
+    return res.json(user.privacy_preferences);
+  } catch (err) {
+    console.error('Update Privacy Error:', err);
+    return res.status(500).json({ error: 'Failed to update privacy preferences.' });
+  }
+});
+
+// 6c. Blocking: block, unblock and list blocked users
+app.post('/api/users/:userId/block', authenticateToken, async (req, res) => {
+  try {
+    const targetId = req.params.userId;
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot block yourself.' });
+    }
+    if (!globalBlocked.has(req.user.id)) globalBlocked.set(req.user.id, []);
+    const list = globalBlocked.get(req.user.id);
+    if (!list.includes(targetId)) list.push(targetId);
+    return res.json({ message: 'User blocked.' });
+  } catch (err) {
+    console.error('Block User Error:', err);
+    return res.status(500).json({ error: 'Failed to block user.' });
+  }
+});
+
+app.delete('/api/users/:userId/block', authenticateToken, async (req, res) => {
+  try {
+    if (globalBlocked.has(req.user.id)) {
+      globalBlocked.set(req.user.id, globalBlocked.get(req.user.id).filter(id => id !== req.params.userId));
+    }
+    return res.json({ message: 'User unblocked.' });
+  } catch (err) {
+    console.error('Unblock User Error:', err);
+    return res.status(500).json({ error: 'Failed to unblock user.' });
+  }
+});
+
+app.get('/api/users/blocked', authenticateToken, async (req, res) => {
+  try {
+    const blockedIds = globalBlocked.get(req.user.id) || [];
+    const blocked = [];
+    for (const id of blockedIds) {
+      const u = await findUserById(id);
+      if (u) blocked.push({ id: u.id, username: u.username, avatar_url: u.avatar_url, email: u.email });
+    }
+    return res.json(blocked);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch blocked users.' });
+  }
+});
+
+// 6d. Web Push Notifications
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({ publicKey: getVapidPublicKey() });
+});
+
+app.post('/api/push/subscribe', authenticateToken, async (req, res) => {
+  try {
+    const { subscription } = req.body || {};
+    if (!subscription || !subscription.endpoint || !subscription.keys?.p256dh || !subscription.keys?.auth) {
+      return res.status(400).json({ error: 'Valid push subscription is required.' });
+    }
+    if (!globalPushSubs.has(req.user.id)) globalPushSubs.set(req.user.id, []);
+    const subs = globalPushSubs.get(req.user.id);
+    const existing = subs.findIndex(s => s.endpoint === subscription.endpoint);
+    if (existing >= 0) subs.splice(existing, 1);
+    subs.push({
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth,
+      created_at: new Date().toISOString()
+    });
+    return res.status(201).json({ message: 'Push subscription saved.' });
+  } catch (err) {
+    console.error('Push Subscribe Error:', err);
+    return res.status(500).json({ error: 'Failed to save push subscription.' });
+  }
+});
+
 // 7. Rooms & Groups Endpoints
 app.get('/api/rooms', authenticateToken, async (req, res) => {
   try {
@@ -682,6 +938,11 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
       r.members && r.members.some(m => m.id === req.user.id) &&
       !(r.cleared_by || []).includes(req.user.id)
     );
+    rooms.forEach(r => {
+      r.is_muted = (globalMutedRooms.get(r.id) || []).includes(req.user.id);
+      r.is_archived = (globalArchivedRooms.get(r.id) || []).includes(req.user.id);
+      r.is_unread = (globalUnreadRooms.get(r.id) || []).includes(req.user.id);
+    });
     return res.json(rooms);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch rooms.' });
@@ -691,7 +952,13 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
 app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   try {
     const { targetUserId } = req.body || {};
-    if (!targetUserId) return res.status(400).json({ error: 'targetUserId required.' });
+    if (!targetUserId) return res.status(400).json({ error: 'targetUserId is required.' });
+    if (String(targetUserId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'Cannot create direct chat with yourself.' });
+    }
+    if (await isBlockedBetween(req.user.id, targetUserId)) {
+      return res.status(403).json({ error: 'You cannot start a chat with this user.' });
+    }
 
     const me = await findUserById(req.user.id);
     const partner = await findUserById(targetUserId);
@@ -717,30 +984,40 @@ app.post('/api/rooms/private', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/rooms/group', authenticateToken, async (req, res) => {
+app.post('/api/rooms/group', authenticateToken, upload.single('avatar'), async (req, res) => {
   try {
-    const { name, description, avatarUrl, themeColor, members } = req.body || {};
+    const { name, description, avatarUrl, themeColor } = req.body || {};
+    let members = req.body.members;
+    if (typeof members === 'string') {
+      try { members = JSON.parse(members); } catch (e) { members = []; }
+    }
     if (!name) return res.status(400).json({ error: 'Group name is required.' });
 
+    let finalAvatar = avatarUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${name}`;
+    if (req.file) {
+      finalAvatar = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    }
+
     const roomId = 'group_' + Date.now() + '_' + Math.random().toString(36).substring(7);
-    const allMemberIds = Array.from(new Set([req.user.id, ...(members || [])]));
+    const allMemberIds = Array.from(new Set([req.user.id, ...(Array.isArray(members) ? members : [])]));
 
     const room = {
       id: roomId,
       type: 'group',
       name,
       description,
-      avatar_url: avatarUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${name}`,
+      avatar_url: finalAvatar,
       theme_color: themeColor || '#128c7e',
       created_by: req.user.id,
       cleared_by: [],
-      members: allMemberIds.map(id => ({ id })),
+      members: allMemberIds.map(id => ({ id, role: id === req.user.id ? 'admin' : 'member' })),
       created_at: new Date().toISOString()
     };
 
     globalRooms.set(roomId, room);
     return res.status(201).json(room);
   } catch (err) {
+    console.error('Create Group Error:', err);
     return res.status(500).json({ error: 'Failed to create group.' });
   }
 });
@@ -748,10 +1025,33 @@ app.post('/api/rooms/group', authenticateToken, async (req, res) => {
 app.post('/api/rooms/bridge', authenticateToken, async (req, res) => {
   try {
     const { sourceRoomId, targetRoomId } = req.body || {};
-    const bridgeId = 'bridge_' + Date.now();
-    return res.status(201).json({ id: bridgeId, sourceRoomId, targetRoomId, createdBy: req.user.id });
+    if (!sourceRoomId || !targetRoomId) {
+      return res.status(400).json({ error: 'sourceRoomId and targetRoomId are required.' });
+    }
+    if (sourceRoomId === targetRoomId) {
+      return res.status(400).json({ error: 'Cannot bridge a room to itself.' });
+    }
+    if (!isRoomMember(sourceRoomId, req.user.id) || !isRoomMember(targetRoomId, req.user.id)) {
+      return res.status(403).json({ error: 'You must be a member of both rooms to bridge them.' });
+    }
+
+    const bridgeId = 'bridge_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+    const bridge = { id: bridgeId, sourceRoomId, targetRoomId, createdBy: req.user.id, created_at: new Date().toISOString() };
+    globalBridges.set(bridgeId, bridge);
+    return res.status(201).json(bridge);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to create room bridge.' });
+  }
+});
+
+app.get('/api/rooms/bridges', authenticateToken, async (req, res) => {
+  try {
+    const bridges = Array.from(globalBridges.values()).filter(b =>
+      isRoomMember(b.sourceRoomId, req.user.id) || isRoomMember(b.targetRoomId, req.user.id)
+    );
+    return res.json(bridges);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch bridges.' });
   }
 });
 
@@ -768,22 +1068,94 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   }
 });
 
+app.put('/api/rooms/:roomId/mute', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    const mutedUsers = globalMutedRooms.get(req.params.roomId) || [];
+    let isMuted = mutedUsers.includes(req.user.id);
+    if (isMuted) {
+      globalMutedRooms.set(req.params.roomId, mutedUsers.filter(id => id !== req.user.id));
+      isMuted = false;
+    } else {
+      globalMutedRooms.set(req.params.roomId, [...mutedUsers, req.user.id]);
+      isMuted = true;
+    }
+    if (room) room.is_muted = isMuted;
+    return res.json({ is_muted: isMuted });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to mute chat.' });
+  }
+});
+
+app.put('/api/rooms/:roomId/archive', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room || !room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const archivedUsers = globalArchivedRooms.get(req.params.roomId) || [];
+    let isArchived = archivedUsers.includes(req.user.id);
+    if (isArchived) {
+      globalArchivedRooms.set(req.params.roomId, archivedUsers.filter(id => id !== req.user.id));
+      isArchived = false;
+    } else {
+      globalArchivedRooms.set(req.params.roomId, [...archivedUsers, req.user.id]);
+      isArchived = true;
+    }
+    room.is_archived = isArchived;
+    return res.json({ is_archived: isArchived });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to archive chat.' });
+  }
+});
+
+app.put('/api/rooms/:roomId/unread', authenticateToken, async (req, res) => {
+  try {
+    const room = globalRooms.get(req.params.roomId);
+    if (!room || !room.members || !room.members.some(m => m.id === req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const unreadUsers = globalUnreadRooms.get(req.params.roomId) || [];
+    let isUnread = unreadUsers.includes(req.user.id);
+    if (isUnread) {
+      globalUnreadRooms.set(req.params.roomId, unreadUsers.filter(id => id !== req.user.id));
+      isUnread = false;
+    } else {
+      globalUnreadRooms.set(req.params.roomId, [...unreadUsers, req.user.id]);
+      isUnread = true;
+    }
+    room.is_unread = isUnread;
+    return res.json({ is_unread: isUnread });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to toggle unread state.' });
+  }
+});
+
 app.post('/api/rooms/:roomId/members', authenticateToken, async (req, res) => {
   try {
     const room = globalRooms.get(req.params.roomId);
     if (!room) return res.status(404).json({ error: 'Room not found.' });
 
+    const { memberIds } = req.body || {};
+    if (!Array.isArray(memberIds) || memberIds.length === 0) {
+      return res.status(400).json({ error: 'memberIds must be a non-empty array.' });
+    }
+
     if (!room.members || !room.members.some(m => m.id === req.user.id)) {
       return res.status(403).json({ error: 'You are not a member of this room.' });
     }
 
-    const { memberIds } = req.body || {};
+    // Group admin roles: only admins may add new members to a group.
+    if (room.type === 'group' && getRoomMemberRole(req.params.roomId, req.user.id) !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can add members.' });
+    }
+
     const ids = Array.isArray(memberIds) ? memberIds : [];
     const existing = new Set((room.members || []).map(m => m.id));
 
     for (const id of ids) {
       if (!existing.has(id)) {
-        room.members.push({ id });
+        room.members.push({ id, role: 'member' });
         existing.add(id);
       }
     }
@@ -844,6 +1216,142 @@ app.delete('/api/rooms/:roomId', authenticateToken, async (req, res) => {
   }
 });
 
+// 11d. WhatsApp-style "Disappearing messages": per-room auto-delete timer (0 = off)
+app.put('/api/rooms/:roomId/disappearing', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const { seconds } = req.body || {};
+    if (!isRoomMember(roomId, req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const valid = [0, 24 * 3600, 7 * 24 * 3600, 90 * 24 * 3600];
+    if (!valid.includes(Number(seconds))) {
+      return res.status(400).json({ error: 'seconds must be 0, 86400, 604800 or 7776000.' });
+    }
+    const room = globalRooms.get(roomId);
+    if (room) {
+      room.disappearing_seconds = Number(seconds);
+      room.disappearing_timer = Number(seconds);
+    }
+    return res.json({ roomId, disappearing_seconds: Number(seconds), updatedBy: req.user.id });
+  } catch (err) {
+    console.error('Set Disappearing Timer Error:', err);
+    return res.status(500).json({ error: 'Failed to update disappearing messages setting.' });
+  }
+});
+
+// 11g. Group admin roles: promote / demote member (admin only)
+app.put('/api/rooms/:roomId/members/:userId/role', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, userId: targetId } = req.params;
+    const { role } = req.body || {};
+
+    if (role !== 'admin' && role !== 'member') {
+      return res.status(400).json({ error: 'role must be "admin" or "member".' });
+    }
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot change your own role.' });
+    }
+
+    const myRole = getRoomMemberRole(roomId, req.user.id);
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can manage roles.' });
+    }
+
+    const targetRole = getRoomMemberRole(roomId, targetId);
+    if (!targetRole) return res.status(404).json({ error: 'Member not found in this group.' });
+
+    const updated = setRoomMemberRole(roomId, targetId, role);
+    return res.json(updated);
+  } catch (err) {
+    console.error('Update Group Role Error:', err);
+    return res.status(500).json({ error: 'Failed to update member role.' });
+  }
+});
+
+// 11h. Remove a member from a group (admin only)
+app.delete('/api/rooms/:roomId/members/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, userId: targetId } = req.params;
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ error: 'Use "Leave group" to exit the group yourself.' });
+    }
+
+    const myRole = getRoomMemberRole(roomId, req.user.id);
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can remove members.' });
+    }
+
+    const removed = removeRoomMember(roomId, targetId);
+    if (!removed) return res.status(404).json({ error: 'Member not found in this group.' });
+
+    const payload = { roomId, removedUserId: targetId, removedBy: req.user.id };
+    return res.json({ message: 'Member removed from the group.', payload });
+  } catch (err) {
+    console.error('Remove Group Member Error:', err);
+    return res.status(500).json({ error: 'Failed to remove member.' });
+  }
+});
+
+// 11i. Leave a group (any member); the last admin leaving auto-promotes someone.
+app.post('/api/rooms/:roomId/leave', authenticateToken, async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const myRole = getRoomMemberRole(roomId, req.user.id);
+    if (!myRole) return res.status(404).json({ error: 'You are not a member of this group.' });
+
+    removeRoomMember(roomId, req.user.id);
+    const remaining = getRoomMemberIds(roomId);
+
+    // If the group is now empty, dissolve it.
+    if (remaining.length === 0) {
+      globalRooms.delete(roomId);
+    } else {
+      // Promote a remaining member to admin if the leaver was the only admin.
+      const admins = remaining.filter(id => getRoomMemberRole(roomId, id) === 'admin');
+      if (admins.length === 0) {
+        setRoomMemberRole(roomId, remaining[0], 'admin');
+      }
+    }
+
+    const payload = { roomId, userId: req.user.id };
+    return res.json({ message: 'You left the group.', payload });
+  } catch (err) {
+    console.error('Leave Group Error:', err);
+    return res.status(500).json({ error: 'Failed to leave group.' });
+  }
+});
+
+// 11j. Group edit: rename / photo / description (admin only)
+app.put('/api/rooms/:roomId', authenticateToken, upload.single('avatar'), async (req, res) => {
+  try {
+    const roomId = req.params.roomId;
+    const myRole = getRoomMemberRole(roomId, req.user.id);
+    if (!myRole) return res.status(404).json({ error: 'You are not a member of this room.' });
+
+    if (myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can edit group details.' });
+    }
+
+    const room = globalRooms.get(roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+    if (req.body.name) room.name = req.body.name;
+    if (req.body.description !== undefined) room.description = req.body.description;
+    if (req.file) {
+      room.avatar_url = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    } else if (req.body.avatarUrl) {
+      room.avatar_url = req.body.avatarUrl;
+    }
+    if (req.body.themeColor) room.theme_color = req.body.themeColor;
+
+    return res.json(room);
+  } catch (err) {
+    console.error('Update Room Error:', err);
+    return res.status(500).json({ error: 'Failed to update group details.' });
+  }
+});
+
 // 8. Messages REST Endpoints
 app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   try {
@@ -860,9 +1368,9 @@ app.get('/api/rooms/:roomId/messages', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/messages', authenticateToken, async (req, res) => {
+app.post('/api/messages', authenticateToken, upload.single('media'), async (req, res) => {
   try {
-    const { roomId, text, type, mediaUrl, replyToId, e2ee } = req.body || {};
+    const { roomId, text, type, replyToId, e2ee, forwarded, forwardedFrom } = req.body || {};
     if (!roomId) return res.status(400).json({ error: 'roomId is required.' });
     // E2EE envelopes carry base64 ciphertext + key material, so allow more room.
     const maxLen = e2ee ? 30000 : 5000;
@@ -874,6 +1382,22 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
     if (!room) return res.status(404).json({ error: 'Room not found.' });
     if (!room.members || !room.members.some(m => m.id === req.user.id)) {
       return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    // Blocked enforcement for 1:1 rooms
+    const memberIds = getRoomMemberIds(roomId);
+    if (memberIds.length === 2) {
+      const otherId = memberIds.find(id => id !== req.user.id);
+      if (otherId && (await isBlockedBetween(req.user.id, otherId))) {
+        return res.status(403).json({ error: 'You cannot send messages to this user.' });
+      }
+    }
+
+    let mediaUrl;
+    if (req.file) {
+      mediaUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    } else if (req.body.mediaUrl) {
+      mediaUrl = req.body.mediaUrl;
     }
 
     const user = await findUserById(req.user.id);
@@ -888,11 +1412,18 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
       sender_name: user ? user.username : req.user.username || 'User',
       sender_avatar: user ? user.avatar_url : '',
       text,
-      type: type || 'text',
+      type: type || (req.file ? (req.file.mimetype.startsWith('video/') ? 'video' : 'image') : 'text'),
       media_url: mediaUrl,
       reply_to_id: replyToId,
       e2ee: Boolean(e2ee),
+      forwarded: Boolean(forwarded),
+      forwarded_from: forwardedFrom || null,
+      read_by: [req.user.id],
+      read_timestamps: {},
+      reactions: {},
       deleted_for: [],
+      edited_at: null,
+      edit_count: 0,
       created_at: new Date().toISOString()
     };
 
@@ -903,6 +1434,7 @@ app.post('/api/messages', authenticateToken, async (req, res) => {
 
     return res.status(201).json(message);
   } catch (err) {
+    console.error('Create Message Error:', err);
     return res.status(500).json({ error: 'Failed to send message.' });
   }
 });
@@ -959,6 +1491,279 @@ app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   }
 });
 
+// WhatsApp-style "Edit message": only the sender can edit. E2EE messages are
+// re-encrypted client-side and arrive here as a fresh ciphertext envelope.
+app.put('/api/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { text, type, e2ee } = req.body || {};
+    if (!text || !String(text).trim()) {
+      return res.status(400).json({ error: 'Message text is required.' });
+    }
+    const maxLen = e2ee ? 30000 : 5000;
+    if (String(text).length > maxLen) {
+      return res.status(400).json({ error: `Message is too long (max ${maxLen} characters).` });
+    }
+
+    const message = findMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+    if (String(message.sender_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'You can only edit messages you sent.' });
+    }
+    if (message.deleted_for_everyone || message.type === 'deleted') {
+      return res.status(400).json({ error: 'This message was deleted and cannot be edited.' });
+    }
+
+    message.text = text;
+    message.type = type || 'text';
+    message.edited_at = new Date().toISOString();
+    message.edit_count = (message.edit_count || 0) + 1;
+    return res.json(message);
+  } catch (err) {
+    console.error('Edit Message Error:', err);
+    return res.status(500).json({ error: 'Failed to edit message.' });
+  }
+});
+
+// WhatsApp-style "Star message": per-user bookmark toggle on any message.
+app.post('/api/messages/:messageId/star', authenticateToken, async (req, res) => {
+  try {
+    const msg = findMessageById(req.params.messageId);
+    if (!msg) return res.status(404).json({ error: 'Message not found.' });
+    const list = Array.isArray(msg.starred_by) ? msg.starred_by : [];
+    const exists = list.includes(req.user.id);
+    msg.starred_by = exists ? list.filter(id => id !== req.user.id) : list.concat(req.user.id);
+    return res.json({ id: msg.id, room_id: msg.room_id, starred_by: msg.starred_by, isStarred: !exists });
+  } catch (err) {
+    console.error('Star Message Error:', err);
+    return res.status(500).json({ error: 'Failed to toggle starred message.' });
+  }
+});
+
+// List a user's starred messages within a room (membership verified).
+app.get('/api/rooms/:roomId/starred', authenticateToken, async (req, res) => {
+  try {
+    if (!isRoomMember(req.params.roomId, req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const messages = (globalMessages.get(req.params.roomId) || [])
+      .filter(m =>
+        Array.isArray(m.starred_by) && m.starred_by.includes(req.user.id) &&
+        !m.deleted_for_everyone &&
+        !(m.deleted_for || []).includes(req.user.id)
+      )
+      .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    return res.json(messages);
+  } catch (err) {
+    console.error('Get Starred Messages Error:', err);
+    return res.status(500).json({ error: 'Failed to fetch starred messages.' });
+  }
+});
+
+// 11f. Message search within a chat
+app.get('/api/rooms/:roomId/search', authenticateToken, async (req, res) => {
+  try {
+    if (!isRoomMember(req.params.roomId, req.user.id)) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const query = String(req.query.q || '').trim();
+    if (!query) return res.json([]);
+    const results = (globalMessages.get(req.params.roomId) || [])
+      .filter(m =>
+        !(m.deleted_for || []).includes(req.user.id) &&
+        !m.deleted_for_everyone &&
+        m.type === 'text' &&
+        m.text && String(m.text).toLowerCase().includes(query.toLowerCase())
+      )
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 50);
+    return res.json(results);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to search messages.' });
+  }
+});
+
+// 11k. Delete for everyone (sender only)
+app.post('/api/messages/:messageId/delete-everyone', authenticateToken, async (req, res) => {
+  try {
+    const message = findMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+    if (String(message.sender_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'You can only delete messages you sent.' });
+    }
+
+    message.deleted_for_everyone = true;
+    message.text = '';
+    message.media_url = '';
+    message.type = 'deleted';
+
+    const payload = { messageId: req.params.messageId, roomId: message.room_id };
+    return res.json({ message: 'Message deleted for everyone.', payload });
+  } catch (err) {
+    console.error('Delete for Everyone Error:', err);
+    return res.status(500).json({ error: 'Failed to delete message for everyone.' });
+  }
+});
+
+// 6e. Report a message (community moderation)
+app.post('/api/messages/:messageId/report', authenticateToken, rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'report' }), async (req, res) => {
+  try {
+    const { reason } = req.body || {};
+    if (!reason || String(reason).length > 500) {
+      return res.status(400).json({ error: 'A reason (max 500 chars) is required.' });
+    }
+    const message = findMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+
+    const reportId = 'rep_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+    globalReports.set(reportId, {
+      id: reportId,
+      message_id: req.params.messageId,
+      reporter_id: req.user.id,
+      room_id: message.room_id,
+      reason,
+      status: 'pending',
+      resolved_by: null,
+      resolved_at: null,
+      created_at: new Date().toISOString()
+    });
+    return res.status(201).json({ id: reportId });
+  } catch (err) {
+    console.error('Report Message Error:', err);
+    return res.status(500).json({ error: 'Failed to submit report.' });
+  }
+});
+
+// Moderation access control (mirrors server/src/server.js). MODERATOR_EMAILS is
+// a comma-separated env list; when unset every logged-in user is a moderator.
+const moderatorEmails = (process.env.MODERATOR_EMAILS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isModerator(user) {
+  if (!user || !user.email) return false;
+  if (moderatorEmails.length === 0) return true;
+  return moderatorEmails.includes(String(user.email).trim().toLowerCase());
+}
+
+function requireModerator(req, res, next) {
+  if (!isModerator(req.user)) {
+    return res.status(403).json({ error: 'Only moderators can access the moderation dashboard.' });
+  }
+  next();
+}
+
+// Moderation dashboard: list reported messages (moderator only)
+app.get('/api/moderation/reports', authenticateToken, requireModerator, async (req, res) => {
+  try {
+    const { status } = req.query || {};
+    const filter = status === 'pending' || status === 'resolved' || status === 'dismissed' ? status : 'pending';
+    const reports = Array.from(globalReports.values())
+      .filter(r => r.status === filter)
+      .map(rep => {
+        const msg = findMessageById(rep.message_id);
+        const sender = msg ? findUserById(msg.sender_id) : null;
+        const reporter = findUserById(rep.reporter_id);
+        const room = globalRooms.get(rep.room_id);
+        return {
+          ...rep,
+          message_text: msg ? msg.text : null,
+          message_type: msg ? msg.type : null,
+          message_e2ee: msg ? Boolean(msg.e2ee) : null,
+          message_created_at: msg ? msg.created_at : null,
+          sender_id: msg ? msg.sender_id : null,
+          sender_username: sender ? (sender.username || sender.email?.split('@')[0] || 'Unknown') : 'Unknown',
+          sender_avatar: sender ? sender.avatar_url : '',
+          reporter_username: reporter ? (reporter.username || reporter.email?.split('@')[0] || 'Unknown') : 'Unknown',
+          reporter_avatar: reporter ? reporter.avatar_url : '',
+          room_name: room ? room.name : null,
+          room_type: room ? room.type : null
+        };
+      })
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return res.json(reports);
+  } catch (err) {
+    console.error('Get Reports Error:', err);
+    return res.status(500).json({ error: 'Failed to fetch reports.' });
+  }
+});
+
+// Resolve / dismiss a report (moderator only)
+app.post('/api/moderation/reports/:reportId/:action', authenticateToken, requireModerator, async (req, res) => {
+  try {
+    const { action } = req.params;
+    if (action !== 'resolve' && action !== 'dismiss') {
+      return res.status(400).json({ error: 'Action must be resolve or dismiss.' });
+    }
+    const status = action === 'resolve' ? 'resolved' : 'dismissed';
+    const rep = globalReports.get(req.params.reportId);
+    if (!rep) return res.status(404).json({ error: 'Report not found.' });
+    rep.status = status;
+    rep.resolved_by = req.user.id;
+    rep.resolved_at = new Date().toISOString();
+    return res.json({ id: rep.id, status: rep.status, resolved_by: rep.resolved_by, resolved_at: rep.resolved_at });
+  } catch (err) {
+    console.error('Moderation action error:', err);
+    return res.status(500).json({ error: 'Failed to update report.' });
+  }
+});
+
+// 11l. Forward a message to one or more rooms (client re-encrypts when E2EE is on)
+app.post('/api/messages/forward', authenticateToken, async (req, res) => {
+  try {
+    const { targetRoomIds, text, type, mediaUrl, originalMessageId, e2ee } = req.body || {};
+    if (!Array.isArray(targetRoomIds) || targetRoomIds.length === 0) {
+      return res.status(400).json({ error: 'targetRoomIds must be a non-empty array.' });
+    }
+
+    const created = [];
+    for (const targetRoomId of targetRoomIds) {
+      if (!isRoomMember(targetRoomId, req.user.id)) continue;
+
+      // Blocked enforcement for 1:1 targets
+      const memberIds = getRoomMemberIds(targetRoomId);
+      if (memberIds.length === 2) {
+        const otherId = memberIds.find(id => id !== req.user.id);
+        if (otherId && (await isBlockedBetween(req.user.id, otherId))) continue;
+      }
+
+      const user = await findUserById(req.user.id);
+      const msg = {
+        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(7),
+        room_id: targetRoomId,
+        sender_id: req.user.id,
+        sender_name: user ? user.username : req.user.username || 'User',
+        sender_avatar: user ? user.avatar_url : '',
+        text,
+        type: type || 'text',
+        media_url: mediaUrl || '',
+        reactions: {},
+        reply_to_id: null,
+        read_by: [req.user.id],
+        read_timestamps: {},
+        deleted_for: [],
+        forwarded: true,
+        forwarded_from: originalMessageId || null,
+        e2ee: Boolean(e2ee),
+        edited_at: null,
+        edit_count: 0,
+        created_at: new Date().toISOString()
+      };
+      if (!globalMessages.has(targetRoomId)) globalMessages.set(targetRoomId, []);
+      globalMessages.get(targetRoomId).push(msg);
+      created.push(msg);
+    }
+
+    if (created.length === 0) {
+      return res.status(403).json({ error: 'Could not forward to any of the selected chats.' });
+    }
+    return res.status(201).json({ messages: created });
+  } catch (err) {
+    console.error('Forward Message Error:', err);
+    return res.status(500).json({ error: 'Failed to forward message.' });
+  }
+});
+
 // 8b. Upload Endpoint (returns an in-memory data URL since serverless has no persistent disk)
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
   try {
@@ -975,18 +1780,35 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
 // 9. Statuses Endpoints
 app.get('/api/statuses', authenticateToken, async (req, res) => {
   try {
-    const statuses = Array.from(globalStatuses.values());
-    return res.json(statuses);
+    const now = Date.now();
+    const cutoff = now - 24 * 60 * 60 * 1000;
+    const expired = [];
+    const active = [];
+    for (const [id, st] of globalStatuses.entries()) {
+      if (new Date(st.created_at).getTime() < cutoff) {
+        expired.push(id);
+      } else {
+        active.push(st);
+      }
+    }
+    // Prune expired statuses so the in-memory store never outlives 24h
+    for (const id of expired) globalStatuses.delete(id);
+    return res.json(active);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch statuses.' });
   }
 });
 
-app.post('/api/statuses', authenticateToken, async (req, res) => {
+app.post('/api/statuses', authenticateToken, upload.single('media'), async (req, res) => {
   try {
     const { text, mediaUrl, mediaType, bgColor } = req.body || {};
     const user = await findUserById(req.user.id);
     const id = 'st_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+
+    let finalMediaUrl = mediaUrl;
+    if (req.file) {
+      finalMediaUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    }
 
     const status = {
       id,
@@ -994,9 +1816,10 @@ app.post('/api/statuses', authenticateToken, async (req, res) => {
       username: user ? user.username : 'User',
       avatar_url: user ? user.avatar_url : '',
       text,
-      media_url: mediaUrl,
-      media_type: mediaType || 'image',
+      media_url: finalMediaUrl,
+      media_type: mediaType || (req.file ? (req.file.mimetype.startsWith('video/') ? 'video' : 'image') : 'image'),
       bg_color: bgColor || '#128c7e',
+      reactions: {},
       created_at: new Date().toISOString()
     };
 
@@ -1004,6 +1827,94 @@ app.post('/api/statuses', authenticateToken, async (req, res) => {
     return res.status(201).json(status);
   } catch (err) {
     return res.status(500).json({ error: 'Failed to create status.' });
+  }
+});
+
+app.post('/api/statuses/:statusId/reactions', authenticateToken, async (req, res) => {
+  try {
+    const { emoji } = req.body || {};
+    if (!emoji) return res.status(400).json({ error: 'Emoji is required.' });
+
+    const status = globalStatuses.get(req.params.statusId);
+    if (!status) return res.status(404).json({ error: 'Status not found.' });
+
+    if (!status.reactions) status.reactions = {};
+    if (!status.reactions[emoji]) status.reactions[emoji] = [];
+    if (status.reactions[emoji].includes(req.user.id)) {
+      status.reactions[emoji] = status.reactions[emoji].filter(id => id !== req.user.id);
+      if (status.reactions[emoji].length === 0) delete status.reactions[emoji];
+    } else {
+      status.reactions[emoji].push(req.user.id);
+    }
+    return res.json({ id: status.id, reactions: status.reactions });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to react to status.' });
+  }
+});
+
+app.post('/api/statuses/:statusId/reply', authenticateToken, async (req, res) => {
+  try {
+    const { reply } = req.body || {};
+    if (!reply || !String(reply).trim()) {
+      return res.status(400).json({ error: 'Reply message is required.' });
+    }
+
+    const status = globalStatuses.get(req.params.statusId);
+    if (!status) return res.status(404).json({ error: 'Status not found.' });
+    if (String(status.user_id) === String(req.user.id)) {
+      return res.status(403).json({ error: 'You cannot reply to your own status.' });
+    }
+
+    const owner = await findUserById(status.user_id);
+    const me = await findUserById(req.user.id);
+
+    // Reuse the same deterministic private-room id as /api/rooms/private
+    const roomId = 'room_' + [req.user.id, status.user_id].sort().join('_');
+    let room = globalRooms.get(roomId);
+    if (!room) {
+      room = {
+        id: roomId,
+        type: 'private',
+        cleared_by: [],
+        partner: me ? { id: me.id, username: me.username || 'Friend', avatar_url: me.avatar_url, bio: me.bio } : { id: req.user.id, username: 'Friend' },
+        members: [{ id: req.user.id }, { id: status.user_id }],
+        created_at: new Date().toISOString()
+      };
+      globalRooms.set(roomId, room);
+    }
+
+    const msgId = 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+    const message = {
+      id: msgId,
+      room_id: roomId,
+      sender_id: req.user.id,
+      sender_name: me ? me.username : 'User',
+      sender_avatar: me ? me.avatar_url : '',
+      text: String(reply).trim(),
+      type: 'status_reply',
+      media_url: '',
+      reply_to_id: null,
+      status_reply: {
+        status_id: status.id,
+        text: status.text || '',
+        media_url: status.media_url || '',
+        media_type: status.media_type || 'image',
+        bg_color: status.bg_color || '#128c7e',
+        username: owner ? owner.username : 'User',
+        avatar_url: owner ? owner.avatar_url : '',
+        created_at: status.created_at
+      },
+      e2ee: false,
+      deleted_for: [],
+      created_at: new Date().toISOString()
+    };
+
+    if (!globalMessages.has(roomId)) globalMessages.set(roomId, []);
+    globalMessages.get(roomId).push(message);
+
+    return res.status(201).json({ room, message });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to reply to status.' });
   }
 });
 

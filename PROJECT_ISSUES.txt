@@ -199,7 +199,7 @@ C5. MessageList has no virtualization
 SECTION D - DEPLOYMENT / VERCEL MISMATCH (BIGGEST ARCHITECTURAL GAP)
 ----------------------------------------------------------------------
 
-D1. api/index.js IS MISSING MOST OF THE CLIENT'S ENDPOINTS
+D1. api/index.js IS MISSING MOST OF THE CLIENT'S ENDPOINTS   [RESOLVED 15-Aug-2026]
     File: api/index.js (route inventory)
     The client calls these but api/index.js has NO route for them:
       - POST /api/rooms/group          (CreateGroupModal.jsx)
@@ -216,12 +216,39 @@ D1. api/index.js IS MISSING MOST OF THE CLIENT'S ENDPOINTS
     message history, cannot delete messages, cannot pin chats, cannot
     upload photos/voice notes/statuses, and cannot save themes.
 
-D2. NO SOCKET.IO ON THE DEPLOYED (VERCEL) VERSION
+    STATUS: Resolved 15-Aug-2026. api/index.js now covers the FULL route
+    surface of server/src/server.js (see FEATURE_LIST.txt section 10):
+      + DELETE /api/users (own account), GET/PUT /api/users/privacy,
+        POST/DELETE /api/users/:userId/block, GET /api/users/blocked
+      + GET /api/push/vapid-public-key, POST /api/push/subscribe
+      + POST /api/messages/:messageId/report
+      + GET /api/rooms/bridges
+      + PUT /api/messages/:messageId (edit), POST .../star,
+        GET /api/rooms/:roomId/starred, GET /api/rooms/:roomId/search
+      + POST /api/messages/:messageId/delete-everyone, POST /api/messages/forward
+      + PUT /api/rooms/:roomId/disappearing, PUT .../members/:userId/role,
+        DELETE .../members/:userId, POST .../leave, PUT /api/rooms/:roomId (edit)
+      + Multipart upload parity on PUT /api/users/profile, POST /api/rooms/group,
+        POST /api/messages, POST /api/statuses, PUT /api/rooms/:roomId
+      + Business rules mirrored: self/blocked checks on private rooms & 1:1
+        sends, admin-only add-members/role/remove/group-edit, last-admin
+        auto-promote on leave, disappearing-seconds whitelist, forward block
+        enforcement.
+    Verified by a 37-assertion HTTP smoke test against the app (all pass).
+
+D2. NO SOCKET.IO ON THE DEPLOYED (VERCEL) VERSION          [RESOLVED 15-Aug-2026]
     File: api/index.js (no socket.io anywhere); socket only in server/src/server.js
     Problem: All real-time messaging goes over socket 'send_message'
     (SocketContext.jsx sendMessage). The Vercel deployment has no
     WebSocket server, so users cannot actually SEND messages on the
     deployed app. There is also no REST fallback for sending messages.
+
+    STATUS: Resolved 15-Aug-2026. SocketContext.sendMessage now falls back to
+    POST /api/messages when the socket is missing/disconnected, and returns the
+    created message; ChatComposer surfaces it through a new onMessageDelivered
+    prop so App.jsx (handleRestDeliveredMessage) decrypts + appends it to the
+    open chat. Real-time presence/typing/receipts still require a full Node
+    host (see deployment.txt - Render recommended).
 
 D3. HARDCODED DEPLOYED URL https://pulse-room-chat-app.vercel.app
     File: api/index.js lines 242, 286, 468

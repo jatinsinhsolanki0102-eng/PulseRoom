@@ -4,15 +4,21 @@ const AuthContext = createContext();
 
 const TOKEN_KEY = 'pulseroom_token';
 
+// Auth sessions are kept in sessionStorage (per-tab), NOT localStorage
+// (shared across every tab of the browser). This lets you run multiple
+// accounts at once - one per tab - without one login clobbering another.
+const storage = () => (typeof sessionStorage !== 'undefined' ? sessionStorage : localStorage);
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || null);
+  const [token, setToken] = useState(() => storage().getItem(TOKEN_KEY) || null);
   const [loading, setLoading] = useState(true);
   const tokenRef = useRef(token);
   tokenRef.current = token;
 
   const logout = () => {
-    localStorage.removeItem(TOKEN_KEY);
+    storage().removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_KEY); // cleanup any legacy shared token
     setToken(null);
     setUser(null);
   };
@@ -36,7 +42,7 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('mode') === 'signup') {
-      localStorage.removeItem(TOKEN_KEY);
+      storage().removeItem(TOKEN_KEY);
       setToken(null);
       setUser(null);
       setLoading(false);
@@ -87,7 +93,8 @@ export function AuthProvider({ children }) {
     if (!res.ok) throw new Error(data.error || 'Login failed.');
 
     if (data.token) {
-      localStorage.setItem(TOKEN_KEY, data.token);
+      storage().setItem(TOKEN_KEY, data.token);
+      localStorage.removeItem(TOKEN_KEY); // drop any stale shared token
       setToken(data.token);
       setUser(data.user);
     }

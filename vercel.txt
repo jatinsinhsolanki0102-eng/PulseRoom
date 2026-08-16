@@ -1,0 +1,102 @@
+===============================================================================
+ PULSEROOM - VERCEL DEPLOYMENT ASSESSMENT
+ Date: 14-Aug-2026
+ Verdict: YES you can deploy - the build will succeed and the site will serve,
+          BUT it will NOT be a fully functional real-time chat on Vercel alone.
+          Vercel can host the static frontend + REST API; the real-time
+          (Socket.IO) server must run somewhere else for full features.
+===============================================================================
+
+WHAT WORKS ON VERCEL (checked, no changes made)
+------------------------------------------------------------------------------
+- vercel.json already exists and is correct:
+    * buildCommand:   npm run build   ->  "cd client && npm install && npm run build"
+    * outputDirectory: client/dist
+    * rewrites:       /api/* -> /api/index.js , everything else -> /index.html
+- Root package.json has every dependency api/index.js imports
+  (express, cors, bcryptjs, jsonwebtoken, multer, nodemailer, dotenv), so the
+  serverless function will install and run on Vercel.
+- api/index.js is a self-contained serverless implementation (46 KB):
+    * Auth (register/login/resend/confirm/forgot) + JWT
+    * Users, profile, theme, rooms (private/group/bridge), messages,
+      e2ee keys, uploads, statuses + reactions/replies, friends/invite,
+      room pin/mute/clear/delete, members add
+    * Uploads use multer memoryStorage -> returned as data: URLs (no filesystem
+      writes) = serverless-safe.
+    * Optional Supabase durable storage via REST (SUPABASE_URL / SUPABASE_ANON_KEY);
+      falls back to in-memory global Maps.
+- Client has NO VITE_/import.meta.env build-time variables -> builds with zero env.
+- .gitignore excludes node_modules, dist, uploads, data, .env -> nothing heavy is
+  committed/uploaded.
+
+ENVIRONMENT VARIABLES TO SET IN VERCEL DASHBOARD (Project -> Settings -> Env)
+------------------------------------------------------------------------------
+  JWT_SECRET             REQUIRED. Without it tokens are random per cold start,
+                         so every login breaks after a few minutes of idle.
+  SUPABASE_URL           Optional (project has hardcoded fallback URL, but set it).
+  SUPABASE_ANON_KEY      Optional (hardcoded fallback exists, but set yours).
+  GMAIL_USER             Email confirmations (needs GMAIL_APP_PASS).
+  GMAIL_APP_PASS         App password for the Gmail account above.
+  RESEND_API_KEY         Alternative email provider.
+  CLIENT_URL             CORS allowlist (your .vercel.app / custom domain).
+  APP_URL                Base URL used in emails/links.
+
+WHAT WILL NOT WORK ON VERCEL (important)
+------------------------------------------------------------------------------
+1. REAL-TIME MESSAGING (the core feature)
+   Socket.IO cannot run on Vercel serverless functions (no persistent
+   connections/WebSockets). On Vercel the client falls back to REST POST for
+   SENDING, but RECEIVING live messages, typing indicators, online presence,
+   read receipts, and voice/video calls will NOT work. Users only see messages
+   when they reload/re-fetch.
+   FIX (no code change made): deploy server/ (Node + Socket.IO) on a separate
+   always-on host (Railway / Fly.io / Render / a VPS) and keep Vercel for the
+   static frontend + REST. The client already connects to a socket server on
+   the same origin (localhost in dev), so point the Node server at your domain
+   or set the SocketContext URL for production.
+
+2. MISSING ROUTES in api/index.js (present in the Node server only) -> 404 on Vercel:
+   - GET  /api/push/vapid-public-key        (web push is server-only)
+   - POST /api/push/subscribe
+   - PUT  /api/rooms/:roomId/disappearing   (disappearing timer)
+   - PUT  /api/messages/:id/star            (starred messages)
+   - GET  /api/rooms/:roomId/starred
+   - PUT  /api/messages/:id                 (edit message)
+   - DELETE /api/messages/:id/delete-everyone
+   - POST /api/messages/forward             (forward message)
+   - POST /api/messages/:id/report          (report / moderation)
+   - GET  /api/users/privacy  / PUT /api/users/privacy
+   - GET  /api/users/blocked
+   - PUT/DELETE /api/users/:userId/block
+   Most are caught by res.ok checks client-side (no crash), but the feature
+   itself is disabled on the Vercel deployment.
+
+3. DATA PERSISTENCE
+   The in-memory global Maps reset on every cold start. Without Supabase env
+   vars, accounts/rooms/messages created on Vercel are lost within minutes.
+   Set SUPABASE_URL + SUPABASE_ANON_KEY (or point the client at your Node
+   server) for durable data.
+
+4. UPLOAD SIZE
+   Vercel serverless has a ~4.5 MB request body limit and data: URLs inflate
+   file size (base64 +33%). Large images/videos will fail to upload.
+
+5. BACKGROUND JOBS / PUSH
+   The status-expiry job, rate-limit state, and web-push (VAPID) only exist in
+   the Node server (server/src/), not in api/index.js.
+
+RECOMMENDED SETUP (best of both)
+------------------------------------------------------------------------------
+- Host  server/  (Express + Socket.IO + PostgreSQL fallback) on Railway/Render/
+  Fly/VPS - this gives real-time, push, jobs, and all features.
+- Deploy the Vercel frontend (client/dist) + api/index.js for static serving and
+  REST parity.
+- Point SocketContext to the Node server URL for production (small config
+  change - currently defaults to same-origin in prod).
+
+BOTTOM LINE
+------------------------------------------------------------------------------
+- Deployable now: YES - build passes, static site + REST API serve fine; good
+  for a portfolio/demo preview.
+- Fully functional chat on Vercel alone: NO - real-time features require the
+  Node/Socket.IO server running elsewhere.

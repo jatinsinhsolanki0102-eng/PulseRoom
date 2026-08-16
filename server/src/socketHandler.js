@@ -6,6 +6,9 @@ import { sendPushToRoom } from './push.js';
 // Active connected sockets tracking
 const userSockets = new Map(); // userId -> Set<socketId>
 
+// Active WebRTC calls: callId -> { mediaType, users: Set<userId> }
+const activeCalls = new Map();
+
 export function setupSocketHandlers(io) {
   // Authentication Middleware for Socket.IO Handshake
   // A socket WITHOUT a valid JWT is rejected outright. The client can never
@@ -196,6 +199,79 @@ export function setupSocketHandlers(io) {
       socket.emit('theme_updated', updated);
     });
 
+    // ---------- WebRTC Voice / Video Call Signaling ----------
+    // Media flows peer-to-peer in the browser; the server only relays signals.
+    const isInActiveCall = (userId) => {
+      for (const call of activeCalls.values()) {
+        if (call.users.has(String(userId))) return true;
+      }
+      return false;
+    };
+
+    socket.on('call_offer', async ({ callId, roomId, targetUserId, mediaType, offer }) => {
+      if (!currentUserId || !callId || !roomId || !targetUserId || !offer) return;
+      const callerInRoom = await db.isRoomMember(roomId, currentUserId);
+      const targetInRoom = await db.isRoomMember(roomId, String(targetUserId));
+      if (!callerInRoom || !targetInRoom) {
+        socket.emit('call_unavailable', { callId, targetUserId, reason: 'not_in_room' });
+        return;
+      }
+      if (!userSockets.has(String(targetUserId))) {
+        socket.emit('call_unavailable', { callId, targetUserId, reason: 'offline' });
+        return;
+      }
+      if (isInActiveCall(currentUserId) || isInActiveCall(targetUserId)) {
+        socket.emit('call_busy', { callId, targetUserId });
+        return;
+      }
+      const caller = await db.findUserById(currentUserId);
+      activeCalls.set(callId, { mediaType, users: new Set([String(currentUserId), String(targetUserId)]) });
+      io.to(`user:${targetUserId}`).emit('call_incoming', {
+        callId,
+        fromUserId: currentUserId,
+        fromName: caller ? (caller.username || 'User') : 'User',
+        fromAvatar: caller ? (caller.avatar_url || '') : '',
+        roomId,
+        mediaType,
+        offer
+      });
+    });
+
+    socket.on('call_answer', ({ callId, targetUserId, answer }) => {
+      const call = activeCalls.get(callId);
+      if (!call || !answer) return;
+      if (!call.users.has(String(currentUserId))) return;
+      io.to(`user:${targetUserId}`).emit('call_answer', { callId, fromUserId: currentUserId, answer });
+    });
+
+    socket.on('call_ice', ({ callId, targetUserId, candidate }) => {
+      const call = activeCalls.get(callId);
+      if (!call || !candidate) return;
+      if (!call.users.has(String(currentUserId))) return;
+      io.to(`user:${targetUserId}`).emit('call_ice', { callId, fromUserId: currentUserId, candidate });
+    });
+
+    socket.on('call_reject', ({ callId, targetUserId }) => {
+      const call = activeCalls.get(callId);
+      if (!call) return;
+      activeCalls.delete(callId);
+      io.to(`user:${targetUserId}`).emit('call_rejected', { callId, fromUserId: currentUserId, reason: 'declined' });
+    });
+
+    socket.on('call_end', ({ callId, targetUserId }) => {
+      activeCalls.delete(callId);
+      if (targetUserId) {
+        io.to(`user:${targetUserId}`).emit('call_ended', { callId, fromUserId: currentUserId });
+      }
+    });
+
+    socket.on('call_cancel', ({ callId, targetUserId }) => {
+      const call = activeCalls.get(callId);
+      if (!call) return;
+      activeCalls.delete(callId);
+      io.to(`user:${targetUserId}`).emit('call_cancelled', { callId, fromUserId: currentUserId });
+    });
+
     // 7. Disconnect Handler
     socket.on('disconnect', async () => {
       if (currentUserId) {
@@ -206,6 +282,14 @@ export function setupSocketHandlers(io) {
             userSockets.delete(currentUserId);
             await db.updateUserStatus(currentUserId, 'offline');
             io.emit('user_presence', { userId: currentUserId, status: 'offline' });
+            // Hang up any call this user was part of
+            for (const [callId, call] of activeCalls) {
+              if (call.users.has(String(currentUserId))) {
+                const peer = Array.from(call.users).find(u => u !== String(currentUserId));
+                activeCalls.delete(callId);
+                if (peer) io.to(`user:${peer}`).emit('call_ended', { callId, fromUserId: currentUserId, reason: 'disconnected' });
+              }
+            }
             console.log(`❌ User disconnected: ${currentUserId}`);
           }
         }

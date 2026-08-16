@@ -1,6 +1,6 @@
 ================================================================================
  PULSEROOM - USER ENGAGEMENT FEATURE LIST
- Updated: 11-Aug-2026
+ Updated: 16-Aug-2026
  Status legend: [✓] DONE   [ ] PENDING   [~] PARTIAL
 ================================================================================
 
@@ -49,13 +49,14 @@
 [✓] Read receipts (grey/blue double-check)  << NEW
 [✓] Disappearing messages (Off / 24h / 7d / 90d)  << NEW
 [✓] Online presence (live socket snapshot, no stale DB status)  << NEW
-[ ] Delete for everyone
-[ ] Edit messages
-[ ] Forward messages
-[ ] Message search inside a chat
-[ ] Media gallery per chat
-[ ] Scheduled / starred messages
-[ ] Voice / video calls
+[✓] Delete for everyone
+[✓] Edit messages
+[✓] Forward messages
+[✓] Message search inside a chat
+[✓] Media gallery per chat  << NEW
+[✓] Scheduled messages (client-side, survives reloads)  << NEW
+[✓] Starred messages (per-user bookmarks, persisted)  << NEW
+[✓] Voice / video calls (WebRTC, peer-to-peer media)  << NEW
 
 ----------------------------------------------------------------------
  5. PERSONALIZATION (key differentiator)
@@ -74,8 +75,8 @@
 [✓] Create image / video status
 [✓] 24-hour status tray grouped by user
 [✓] View tracking (seen / allSeen)
-[ ] Status reactions / replies
-[ ] Status expiration job (currently memory only)
+[✓] Status reactions / replies
+[✓] Status expiration job (server-side 24h cleanup, PG + memory)  << NEW
 
 ----------------------------------------------------------------------
  7. PRIVACY & SAFETY
@@ -103,10 +104,10 @@
 [✓] Web Push notifications to offline members  << NEW
 [✓] VAPID key auto-generation + env override
 [✓] Service worker (sw.js): notification click -> focus app
-[ ] Notification sound / badge count
-[ ] Deep-link / open specific room from notification
-[ ] Mute per-chat notifications
-[ ] Unread badge counts on chats
+[✓] Notification sound / badge count
+[✓] Deep-link / open specific room from notification
+[✓] Mute per-chat notifications
+[✓] Unread badge counts on chats
 
 ----------------------------------------------------------------------
  9. DATA & RELIABILITY
@@ -122,39 +123,47 @@
  10. REMAINING / BACKLOG (grouped by priority)
 ----------------------------------------------------------------------
 HIGH
-[ ] Unread message counts + per-chat badge (retention driver)
-[ ] Message search within chat
-[ ] Group admin roles: promote/demote, remove member, leave group
-[ ] Group edit: rename / photo / description
-[ ] Delete for everyone
-[ ] Forward messages
-[ ] api/index.js (Vercel) parity with server routes + sockets (D1/D2 gap)
+[✓] Unread message counts + per-chat badge (retention driver)
+[✓] Message search within chat
+[✓] Group admin roles: promote/demote, remove member, leave group
+[✓] Group edit: rename / photo / description
+[✓] Delete for everyone
+[✓] Forward messages
+[✓] api/index.js (Vercel) parity with server routes + sockets (D1/D2 gap)
 
 MEDIUM
-[ ] Archive chats
-[ ] Read/unread toggle per chat
-[ ] Mute chats (with sound toggle)
-[ ] Edit messages
-[ ] Media gallery per chat
-[ ] Moderation dashboard for reported messages
-[ ] "Last seen 5 min ago" formatted timestamps
-[ ] PWA installable + offline cache
-[ ] Push sound + badge + deep-link to room
+[✓] Archive chats
+[✓] Read/unread toggle per chat
+[✓] Mute chats (with sound toggle)
+[✓] Edit messages
+[✓] Media gallery per chat
+[✓] Starred messages
+[✓] Scheduled messages
+[✓] Voice / video calls
+[✓] Moderation dashboard for reported messages
+[✓] "Last seen 5 min ago" formatted timestamps
+[✓] PWA installable + offline cache
+      - Web app manifest (standalone, theme colors, 192/512 + maskable icons)
+      - Custom "Install App" button (beforeinstallprompt) in the sidebar menu
+      - Service worker offline cache: cached app shell + assets, network-first
+        navigations with offline fallback, live API/media never cached
+[✓] Push sound + badge + deep-link to room
 
 ENGAGEMENT / GAMIFICATION (growth focus)
 [ ] Daily streaks & active-day calendar
 [ ] Achievements / badges (first message, group created, 7-day streak)
 [ ] Chat stats dashboard (messages sent, top chats, words)
-[ ] Status reactions / replies
+[✓] Status reactions / replies
 [ ] GIF / sticker packs
 [ ] Smart replies
 [ ] Voice rooms (live audio channels)
 [ ] Communities (multi-group spaces)
 
-================================================================================
- NOTES
 ===============================================================================
-- Statuses have no server-side 24h expiry job yet.
+ NOTES
+==============================================================================
+- Statuses have server-side 24h expiry now (job runs at boot + every 30 min).
+- Status replies open a DM with the author and quote the story in the chat.
 - Real-time features require Socket.IO; Vercel serverless has no sockets.
 ================================================================================
  END OF FEATURE LIST

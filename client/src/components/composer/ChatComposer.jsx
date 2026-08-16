@@ -4,9 +4,10 @@ import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
 import { useE2EE } from '../../context/E2EEContext';
 import { encryptFileBytes } from '../../crypto/e2ee';
-import { Send, Mic, Square, Paperclip, Smile, X, Lock, Video } from 'lucide-react';
+import EmojiPicker from './EmojiPicker';
+import { Send, Mic, Square, Paperclip, Smile, X, Lock, Video, Clock } from 'lucide-react';
 
-export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
+export default function ChatComposer({ room, roomId, replyTo, onCancelReply, editingMessage, onCancelEdit, onEditSubmit, onSchedule, onMessageDelivered }) {
   const { sendMessage, setTyping } = useSocket();
   const { theme } = useTheme();
   const { token } = useAuth();
@@ -17,15 +18,25 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
   const [recordTimer, setRecordTimer] = useState(0);
   const [pendingMedia, setPendingMedia] = useState(null); // { file, type, mime, previewUrl }
   const [showEmojiDrawer, setShowEmojiDrawer] = useState(false);
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  const [scheduleTime, setScheduleTime] = useState('');
 
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const timerIntervalRef = useRef(null);
   const fileInputRef = useRef(null);
   const videoInputRef = useRef(null);
+  const composerInputRef = useRef(null);
 
   // Typing debounce timer
   const typingTimeoutRef = useRef(null);
+
+  // Preload the message being edited into the composer
+  useEffect(() => {
+    if (editingMessage) {
+      setText(editingMessage.decryptedText || editingMessage.text || '');
+    }
+  }, [editingMessage?.id]);
 
   // Revoke object URLs when a pending media preview is replaced/removed
   useEffect(() => {
@@ -50,6 +61,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
     setPendingMedia(null);
     setTyping(roomId, false);
     if (onCancelReply) onCancelReply();
+    if (onCancelEdit) onCancelEdit();
   };
 
   // Can we encrypt media? 1:1 needs the partner's identity key; groups need our keys ready.
@@ -67,7 +79,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
       type: 'text'
     };
     const encrypted = await encryptForSend(room, inner);
-    sendMessage({
+    const delivered = await sendMessage({
       roomId,
       text: encrypted.text,
       type: encrypted.type || 'text',
@@ -75,6 +87,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
       replyToId: replyTo?.id || null,
       e2ee: Boolean(encrypted.e2ee)
     });
+    if (delivered && onMessageDelivered) onMessageDelivered(delivered);
   };
 
   const sendMediaMessage = async (textValue, media) => {
@@ -106,7 +119,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
           };
           const encrypted = await encryptForSend(room, inner);
           if (encrypted.e2ee) {
-            sendMessage({
+            const delivered = await sendMessage({
               roomId,
               text: encrypted.text,
               type: encrypted.type,
@@ -114,6 +127,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
               replyToId: replyTo?.id || null,
               e2ee: true
             });
+            if (delivered && onMessageDelivered) onMessageDelivered(delivered);
             return;
           }
         }
@@ -132,7 +146,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
     });
     if (res.ok) {
       const data = await res.json();
-      sendMessage({
+      const delivered = await sendMessage({
         roomId,
         text: textValue || mediaLabel,
         type: media.type,
@@ -140,13 +154,97 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
         replyToId: replyTo?.id || null,
         e2ee: false
       });
+      if (delivered && onMessageDelivered) onMessageDelivered(delivered);
+    }
+  };
+
+  // Prepare a scheduled payload: media is encrypted + uploaded NOW, but nothing
+  // is sent. The scheduler re-encrypts a fresh envelope when the time arrives.
+  const prepareScheduledPayload = async (textValue, mediaObj) => {
+    let mediaUrl = '';
+    let mediaKey = null;
+    let mediaNonce = null;
+    let mime = mediaObj?.mime || '';
+    let mediaType = mediaObj?.type || 'text';
+
+    if (mediaObj) {
+      if (await canEncryptMedia()) {
+        try {
+          const fileBytes = await mediaObj.file.arrayBuffer();
+          const enc = await encryptFileBytes(fileBytes);
+          const formData = new FormData();
+          formData.append('file', new Blob([enc.cipher], { type: 'application/octet-stream' }), `encrypted_${mediaObj.file.name || 'media.bin'}`);
+          const res = await fetch('/api/upload', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+            body: formData
+          });
+          if (res.ok) {
+            const data = await res.json();
+            mediaUrl = data.mediaUrl;
+            mediaKey = enc.key;
+            mediaNonce = enc.nonce;
+            mime = mediaObj.mime || 'application/octet-stream';
+          }
+        } catch (err) {
+          console.warn('E2EE scheduled media upload failed, using plaintext:', err.message);
+        }
+      }
+      if (!mediaUrl) {
+        const formData = new FormData();
+        formData.append('file', mediaObj.file);
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData
+        });
+        if (res.ok) {
+          const data = await res.json();
+          mediaUrl = data.mediaUrl;
+          mediaType = data.mediaType || mediaObj.type;
+        }
+      }
+    }
+
+    return { text: textValue, mediaUrl, mediaKey, mediaNonce, mime, mediaType };
+  };
+
+  const handleScheduleConfirm = async () => {
+    if (!scheduleTime) return;
+    const when = new Date(scheduleTime);
+    if (isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+      alert('Please pick a future time for the scheduled message.');
+      return;
+    }
+    if (!text.trim() && !pendingMedia) return;
+    if (!onSchedule) return;
+    try {
+      const payload = await prepareScheduledPayload(text.trim(), pendingMedia || undefined);
+      onSchedule({
+        ...payload,
+        scheduledAt: when.toISOString(),
+        roomId,
+        roomType: room?.type || 'group',
+        partnerId: room?.type === 'private' ? room?.partner?.id : null
+      });
+      if (pendingMedia?.previewUrl) URL.revokeObjectURL(pendingMedia.previewUrl);
+      setPendingMedia(null);
+      setScheduleTime('');
+      setShowSchedulePicker(false);
+      resetComposer();
+    } catch (err) {
+      console.error('Schedule error:', err);
+      alert('Failed to schedule the message.');
     }
   };
 
   const handleSend = async () => {
     if (!text.trim() && !pendingMedia) return;
 
-    if (pendingMedia) {
+    if (editingMessage) {
+      if (!text.trim()) return;
+      await onEditSubmit(editingMessage, text.trim());
+    } else if (pendingMedia) {
       await sendMediaMessage(text.trim(), pendingMedia);
     } else {
       await sendTextMessage(text.trim());
@@ -196,7 +294,7 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
   // Media Upload File Handler (image via paperclip, video via the video button)
   const handleFileUpload = (e, mediaType) => {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file || editingMessage) return;
 
     const resolvedType = mediaType
       || (file.type.startsWith('video/') ? 'video'
@@ -219,6 +317,24 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
   const shapeClass = `composer-shape-${theme.chatBarShape || 'floating-pill'}`;
   const sendBtnClass = `send-btn-${theme.sendButtonStyle || 'gradient-circle'}`;
 
+  const insertEmoji = (emoji) => {
+    const el = composerInputRef.current;
+    if (el) {
+      const start = el.selectionStart ?? text.length;
+      const end = el.selectionEnd ?? text.length;
+      const next = text.slice(0, start) + emoji + text.slice(end);
+      setText(next);
+      requestAnimationFrame(() => {
+        el.focus();
+        const pos = start + emoji.length;
+        el.setSelectionRange(pos, pos);
+      });
+    } else {
+      setText(prev => (prev ? prev + emoji : emoji));
+    }
+    setShowEmojiDrawer(false);
+  };
+
   return (
     <div className="composer-wrapper">
       {/* Quick Reply Chips Bar */}
@@ -233,6 +349,31 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
           </button>
         ))}
       </div>
+
+      {/* Editing Message Header */}
+      {editingMessage && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          background: 'rgba(56, 189, 248, 0.15)',
+          borderLeft: '3px solid #38bdf8',
+          padding: '0.5rem 1rem',
+          borderRadius: '10px',
+          marginBottom: '0.5rem',
+          fontSize: '0.85rem'
+        }}>
+          <div>
+            <span style={{ fontWeight: '700', color: '#38bdf8' }}>Editing message: </span>
+            <span style={{ color: 'var(--text-muted)' }}>
+              {editingMessage.decryptedText || (editingMessage.e2ee ? '🔒 Encrypted message' : editingMessage.text)}
+            </span>
+          </div>
+          <button onClick={onCancelEdit} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}>
+            <X size={16} />
+          </button>
+        </div>
+      )}
 
       {/* Reply Thread Header */}
       {replyTo && (
@@ -287,6 +428,59 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
         </div>
       )}
 
+      {/* Schedule Message Picker */}
+      {showSchedulePicker && (
+        <div className="schedule-picker glass-panel">
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+            <span style={{ fontSize: '0.85rem', fontWeight: '700', display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-main)' }}>
+              <Clock size={14} /> Schedule Message
+            </span>
+            <button
+              onClick={() => setShowSchedulePicker(false)}
+              style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+            <input
+              type="datetime-local"
+              value={scheduleTime}
+              onChange={(e) => setScheduleTime(e.target.value)}
+              style={{
+                flex: 1,
+                padding: '0.45rem 0.6rem',
+                borderRadius: '10px',
+                border: '1px solid var(--panel-border)',
+                background: 'rgba(15,23,42,0.8)',
+                color: 'var(--text-main)',
+                fontSize: '0.85rem'
+              }}
+            />
+            <button
+              onClick={handleScheduleConfirm}
+              disabled={!scheduleTime}
+              style={{
+                padding: '0.45rem 0.9rem',
+                borderRadius: '10px',
+                border: 'none',
+                background: 'linear-gradient(135deg, #6366f1, #a855f7)',
+                color: 'white',
+                fontWeight: '700',
+                cursor: scheduleTime ? 'pointer' : 'not-allowed',
+                opacity: scheduleTime ? 1 : 0.5,
+                fontSize: '0.85rem'
+              }}
+            >
+              Schedule
+            </button>
+          </div>
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '0.5rem' }}>
+            The message (and any attachment) is encrypted on your device and sent automatically at the selected time.
+          </p>
+        </div>
+      )}
+
       {/* Dynamic Composer Shape Container */}
       <div className={shapeClass}>
         <input
@@ -305,23 +499,36 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
           style={{ display: 'none' }}
         />
 
-        <button
-          className="action-icon-btn"
-          style={{ border: 'none', background: 'transparent' }}
-          onClick={() => fileInputRef.current?.click()}
-          title="Attach Image"
-        >
-          <Paperclip size={20} />
-        </button>
+        {!editingMessage && (
+          <>
+            <button
+              className="action-icon-btn"
+              style={{ border: 'none', background: 'transparent' }}
+              onClick={() => fileInputRef.current?.click()}
+              title="Attach Image"
+            >
+              <Paperclip size={20} />
+            </button>
 
-        <button
-          className="action-icon-btn"
-          style={{ border: 'none', background: 'transparent' }}
-          onClick={() => videoInputRef.current?.click()}
-          title="Attach Video"
-        >
-          <Video size={20} />
-        </button>
+            <button
+              className="action-icon-btn"
+              style={{ border: 'none', background: 'transparent' }}
+              onClick={() => videoInputRef.current?.click()}
+              title="Attach Video"
+            >
+              <Video size={20} />
+            </button>
+
+            <button
+              className="action-icon-btn"
+              style={{ border: 'none', background: 'transparent' }}
+              onClick={() => setShowSchedulePicker(!showSchedulePicker)}
+              title="Schedule message"
+            >
+              <Clock size={20} />
+            </button>
+          </>
+        )}
 
         <button
           className="action-icon-btn"
@@ -341,7 +548,8 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
           <input
             type="text"
             className="composer-input"
-            placeholder="Type your real-time message..."
+            ref={composerInputRef}
+            placeholder={editingMessage ? 'Edit your message...' : 'Type your real-time message...'}
             value={text}
             onChange={handleTextChange}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
@@ -349,7 +557,11 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
         )}
 
         <div className="composer-actions">
-          {isRecording ? (
+          {editingMessage ? (
+            <button className={sendBtnClass} onClick={handleSend} title="Save changes">
+              <Send size={18} />
+            </button>
+          ) : isRecording ? (
             <button className="send-btn-gradient-circle" style={{ background: '#ef4444' }} onClick={stopRecording}>
               <Square size={18} />
             </button>
@@ -364,6 +576,14 @@ export default function ChatComposer({ room, roomId, replyTo, onCancelReply }) {
           )}
         </div>
       </div>
+
+      {/* Emoji Picker Drawer */}
+      {showEmojiDrawer && (
+        <EmojiPicker
+          onPick={insertEmoji}
+          onClose={() => setShowEmojiDrawer(false)}
+        />
+      )}
     </div>
   );
 }

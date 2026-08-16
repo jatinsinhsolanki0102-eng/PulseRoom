@@ -137,6 +137,35 @@ const allowedOrigins = (process.env.CLIENT_URL || '').split(',').map(s => s.trim
 if (allowedOrigins.length === 0) {
   console.warn('⚠️  CLIENT_URL is not set - CORS will allow all origins. Set CLIENT_URL in server/.env for production.');
 }
+
+// CLIENT_URL may be a comma-separated list of CORS origins. For building links
+// (invite emails, confirmation redirects) we must use a single URL - the first
+// configured origin - never the raw comma-joined string.
+function getClientUrl() {
+  const origins = (process.env.CLIENT_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+  return (origins[0] || 'http://localhost:3000').replace(/\/$/, '');
+}
+
+// Moderation access control. Set MODERATOR_EMAILS (comma-separated) in .env to
+// restrict the reports dashboard to specific accounts. When unset, every logged
+// in user can access it (convenient for local dev / single-tenant testing).
+const moderatorEmails = (process.env.MODERATOR_EMAILS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isModerator(user) {
+  if (!user || !user.email) return false;
+  if (moderatorEmails.length === 0) return true;
+  return moderatorEmails.includes(String(user.email).trim().toLowerCase());
+}
+
+function requireModerator(req, res, next) {
+  if (!isModerator(req.user)) {
+    return res.status(403).json({ error: 'Only moderators can access the moderation dashboard.' });
+  }
+  next();
+}
 const corsOrigin = allowedOrigins.length > 0
   ? (origin, callback) => {
       if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
@@ -215,8 +244,7 @@ app.get('/api/health', (req, res) => {
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App
 app.get('/', (req, res) => {
-  const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
-  res.redirect(clientUrl);
+  res.redirect(getClientUrl());
 });
 
 // 1. Auth: Sign Up (Email Confirmation Required Before Login)
@@ -367,7 +395,7 @@ app.get('/api/auth/confirm-email', async (req, res) => {
       }
     }
 
-    const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const clientUrl = getClientUrl();
 
     res.send(`
       <html>
@@ -421,6 +449,7 @@ app.post('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name:
     }
 
     const { password_hash, ...safeUser } = user;
+    safeUser.is_moderator = isModerator(safeUser);
     const token = generateToken(safeUser);
 
     res.json({ token, user: safeUser });
@@ -463,6 +492,7 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
     const user = await db.findUserById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found.' });
     const { password_hash, ...safeUser } = user;
+    safeUser.is_moderator = isModerator(safeUser);
     res.json(safeUser);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch user profile.' });
@@ -636,6 +666,42 @@ app.post('/api/messages/:messageId/report', authenticateToken, rateLimit({ windo
   } catch (err) {
     console.error('Report Message Error:', err);
     res.status(500).json({ error: 'Failed to submit report.' });
+  }
+});
+
+// 6e1. Moderation dashboard: list reported messages (moderator only)
+app.get('/api/moderation/reports', authenticateToken, requireModerator, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const reports = await db.getReports({ status: status || 'pending' });
+    res.json(reports);
+  } catch (err) {
+    console.error('Get Reports Error:', err);
+    res.status(500).json({ error: 'Failed to fetch reports.' });
+  }
+});
+
+// 6e2. Resolve a report (moderator only) - content reviewed, no further action needed
+app.post('/api/moderation/reports/:reportId/resolve', authenticateToken, requireModerator, async (req, res) => {
+  try {
+    const updated = await db.updateReportStatus(req.params.reportId, req.user.id, 'resolved');
+    if (!updated) return res.status(404).json({ error: 'Report not found.' });
+    res.json(updated);
+  } catch (err) {
+    console.error('Resolve Report Error:', err);
+    res.status(500).json({ error: 'Failed to resolve report.' });
+  }
+});
+
+// 6e3. Dismiss a report (moderator only) - report is invalid or no action required
+app.post('/api/moderation/reports/:reportId/dismiss', authenticateToken, requireModerator, async (req, res) => {
+  try {
+    const updated = await db.updateReportStatus(req.params.reportId, req.user.id, 'dismissed');
+    if (!updated) return res.status(404).json({ error: 'Report not found.' });
+    res.json(updated);
+  } catch (err) {
+    console.error('Dismiss Report Error:', err);
+    res.status(500).json({ error: 'Failed to dismiss report.' });
   }
 });
 
@@ -821,6 +887,71 @@ app.delete('/api/messages/:messageId', authenticateToken, async (req, res) => {
   }
 });
 
+// WhatsApp-style "Edit message": only the sender can edit. E2EE messages are
+// re-encrypted client-side and arrive here as a fresh ciphertext envelope.
+app.put('/api/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { text, type, e2ee } = req.body;
+    if (!text || !String(text).trim()) {
+      return res.status(400).json({ error: 'Message text is required.' });
+    }
+    const maxLen = e2ee ? 30000 : 5000;
+    if (String(text).length > maxLen) {
+      return res.status(400).json({ error: `Message is too long (max ${maxLen} characters).` });
+    }
+
+    const message = await db.getMessageById(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found.' });
+    if (String(message.sender_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'You can only edit messages you sent.' });
+    }
+    if (message.deleted_for_everyone || message.type === 'deleted') {
+      return res.status(400).json({ error: 'This message was deleted and cannot be edited.' });
+    }
+
+    const updated = await db.editMessage(req.params.messageId, req.user.id, text, type || 'text');
+    if (!updated) return res.status(404).json({ error: 'Message not found.' });
+
+    io.to(message.room_id).emit('message_edited', updated);
+    io.to(`user:${req.user.id}`).emit('message_edited', updated);
+    res.json(updated);
+  } catch (err) {
+    console.error('Edit Message Error:', err);
+    res.status(500).json({ error: 'Failed to edit message.' });
+  }
+});
+
+// WhatsApp-style "Star message": per-user bookmark toggle on any message.
+app.post('/api/messages/:messageId/star', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.toggleStar(req.params.messageId, req.user.id);
+    if (!result) return res.status(404).json({ error: 'Message not found.' });
+    io.to(result.room_id).emit('message_starred', {
+      messageId: result.id,
+      roomId: result.room_id,
+      isStarred: result.isStarred,
+      userId: req.user.id
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('Star Message Error:', err);
+    res.status(500).json({ error: 'Failed to toggle starred message.' });
+  }
+});
+
+// List a user's starred messages within a room (membership verified).
+app.get('/api/rooms/:roomId/starred', authenticateToken, async (req, res) => {
+  try {
+    const isMember = await db.isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) return res.status(403).json({ error: 'You are not a member of this room.' });
+    const messages = await db.getStarredMessages(req.params.roomId, req.user.id);
+    res.json(messages);
+  } catch (err) {
+    console.error('Get Starred Messages Error:', err);
+    res.status(500).json({ error: 'Failed to fetch starred messages.' });
+  }
+});
+
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
   const mediaUrl = `/uploads/${req.file.filename}`;
@@ -831,7 +962,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
 // 10. Statuses (Stories) Routes
 app.get('/api/statuses', authenticateToken, async (req, res) => {
   try {
-    const statuses = await db.getStatuses();
+    const statuses = await db.getAllActiveStatuses();
     res.json(statuses);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch statuses.' });
@@ -878,6 +1009,53 @@ app.delete('/api/statuses/:statusId', authenticateToken, async (req, res) => {
   }
 });
 
+// Status reaction toggle (WhatsApp-style emoji per user)
+app.post('/api/statuses/:statusId/reactions', authenticateToken, async (req, res) => {
+  try {
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ error: 'Emoji is required.' });
+
+    const result = await db.toggleStatusReaction(req.params.statusId, emoji, req.user.id);
+    if (!result) return res.status(404).json({ error: 'Status not found.' });
+
+    io.emit('status_reaction', { statusId: result.id, reactions: result.reactions });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to react to status.' });
+  }
+});
+
+// Status reply: opens/creates a DM with the status author and sends a quoted reply
+app.post('/api/statuses/:statusId/reply', authenticateToken, async (req, res) => {
+  try {
+    const { reply } = req.body;
+    if (!reply || !String(reply).trim()) {
+      return res.status(400).json({ error: 'Reply message is required.' });
+    }
+
+    const result = await db.createStatusReply({
+      statusId: req.params.statusId,
+      replierId: req.user.id,
+      reply: String(reply).trim()
+    });
+    if (!result) return res.status(404).json({ error: 'Status not found.' });
+    if (result.error) return res.status(403).json({ error: result.error });
+
+    const { room, message } = result;
+    const memberIds = await db.getRoomMemberIds(room.id);
+    for (const memberId of memberIds) {
+      io.to(`user:${memberId}`).emit('new_message', message);
+    }
+    notifyRoomCreated(io, room, memberIds);
+    sendPushToRoom(io, room.id, { id: req.user.id, username: message.sender_name }, message);
+
+    res.status(201).json({ room, message });
+  } catch (err) {
+    console.error('Status Reply Error:', err);
+    res.status(500).json({ error: 'Failed to reply to status.' });
+  }
+});
+
 // 11. Toggle Pin Chat
 app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
   try {
@@ -889,6 +1067,51 @@ app.put('/api/rooms/:roomId/pin', authenticateToken, async (req, res) => {
     res.json({ is_pinned: isPinned });
   } catch (err) {
     res.status(500).json({ error: 'Failed to pin chat.' });
+  }
+});
+
+// 11a. Toggle per-chat notification mute
+app.put('/api/rooms/:roomId/mute', authenticateToken, async (req, res) => {
+  try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const isMuted = await db.toggleMuteRoom(req.user.id, req.params.roomId);
+    res.json({ is_muted: isMuted });
+  } catch (err) {
+    console.error('Toggle mute error:', err);
+    res.status(500).json({ error: 'Failed to mute chat.' });
+  }
+});
+
+// 11a1. Toggle chat archive (WhatsApp-style: hidden from the main inbox)
+app.put('/api/rooms/:roomId/archive', authenticateToken, async (req, res) => {
+  try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const isArchived = await db.toggleArchiveRoom(req.user.id, req.params.roomId);
+    res.json({ is_archived: isArchived });
+  } catch (err) {
+    console.error('Toggle archive error:', err);
+    res.status(500).json({ error: 'Failed to archive chat.' });
+  }
+});
+
+// 11a2. Toggle manual mark-as-unread / mark-as-read per chat
+app.put('/api/rooms/:roomId/unread', authenticateToken, async (req, res) => {
+  try {
+    const isMember = await isRoomMember(req.params.roomId, req.user.id);
+    if (!isMember) {
+      return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+    const isUnread = await db.toggleUnreadRoom(req.user.id, req.params.roomId);
+    res.json({ is_unread: isUnread });
+  } catch (err) {
+    console.error('Toggle unread error:', err);
+    res.status(500).json({ error: 'Failed to toggle unread state.' });
   }
 });
 
@@ -904,6 +1127,13 @@ app.post('/api/rooms/:roomId/members', authenticateToken, async (req, res) => {
     const existingMemberIds = await db.getRoomMemberIds(roomId);
     if (!existingMemberIds.includes(req.user.id)) {
       return res.status(403).json({ error: 'You are not a member of this room.' });
+    }
+
+    // Group admin roles: only admins may add new members to a group.
+    const roomRow = await db.getRoomById(roomId);
+    const myRole = await db.getRoomMemberRole(roomId, req.user.id);
+    if (roomRow && roomRow.type === 'group' && myRole !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can add members.' });
     }
 
     const allMemberIds = await db.addRoomMembers(roomId, memberIds);
@@ -1257,7 +1487,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
       const room = await db.getOrCreatePrivateRoom(req.user.id, targetUser.id);
       notifyRoomCreated(io, room, [req.user.id, targetUser.id]);
       
-      const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const clientUrl = getClientUrl();
       const htmlText = `
         <div style="font-family: Arial, sans-serif; padding: 25px; background: #0b0f19; color: #ffffff; border-radius: 16px; max-width: 480px; margin: 0 auto;">
           <h1 style="color: #10b981;">PulseRoom</h1>
@@ -1281,7 +1511,7 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
       });
     } else {
       // UNREGISTERED OR UNCONFIRMED: Dispatches email ONLY! NO CHAT ROOM OPENED!
-      const clientUrl = (process.env.CLIENT_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const clientUrl = getClientUrl();
       const inviteSignupUrl = `${clientUrl}/?mode=signup&email=${encodeURIComponent(cleanEmail)}&inviter=${encodeURIComponent(req.user.username)}`;
 
       const htmlText = `
@@ -1330,6 +1560,21 @@ app.post('/api/friends/invite', authenticateToken, async (req, res) => {
   }
 });
 
+// Serve the built React app (single-service deploy: Render hosts frontend + backend).
+// The dist folder may sit under <repo>/client/dist or <repo-root-parent>/client/dist
+// depending on where the platform starts `node src/server.js`.
+const clientDist = [
+  path.resolve(process.cwd(), 'client', 'dist'),
+  path.resolve(process.cwd(), '..', 'client', 'dist')
+].find((p) => fs.existsSync(p));
+if (clientDist) {
+  app.use(express.static(clientDist));
+  app.get(/^\/(?!api\/|uploads\/|socket\.io).*/, (req, res, next) => {
+    if (req.path.includes('.')) return next();
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
+
 // Boot backend server with port listener and error handling
 initDb().then(() => {
   server.on('error', (e) => {
@@ -1351,6 +1596,21 @@ initDb().then(() => {
       console.error('Disappearing messages cleanup error:', e.message);
     }
   }, 30 * 1000);
+
+  // Status / stories 24h expiry job - runs at startup, then every 30 minutes
+  const runStatusExpiryJob = async () => {
+    try {
+      const expiredIds = await db.deleteExpiredStatuses();
+      if (expiredIds && expiredIds.length > 0) {
+        for (const id of expiredIds) io.emit('status_deleted', id);
+        console.log(`🧹 Status expiry job: removed ${expiredIds.length} expired status(es).`);
+      }
+    } catch (e) {
+      console.error('Status expiry job error:', e.message);
+    }
+  };
+  runStatusExpiryJob();
+  setInterval(runStatusExpiryJob, 30 * 60 * 1000);
 
   server.listen(PORT, () => {
     console.log(`🚀 PulseRoom Server listening on http://localhost:${PORT}`);

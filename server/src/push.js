@@ -64,6 +64,8 @@ export async function sendPushToRoom(io, roomId, sender, message) {
   const memberIds = await db.getRoomMemberIds(roomId);
   for (const memberId of memberIds) {
     if (String(memberId) === String(sender.id)) continue;
+    // Per-chat mute: still deliver the live message, but no push notification.
+    if (await db.isRoomMuted(memberId, roomId)) continue;
     const userRoom = io.sockets.adapter.rooms.get(`user:${memberId}`);
     if (userRoom && userRoom.size > 0) continue; // connected via socket - skip push
     await sendPushToUser(memberId, {

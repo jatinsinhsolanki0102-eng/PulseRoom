@@ -3,11 +3,40 @@ import { useAuth } from '../../context/AuthContext';
 import { useSocket } from '../../context/SocketContext';
 import VoicePlayer from './VoicePlayer';
 import DecryptedMedia from './DecryptedMedia';
-import { Smile, Reply, CheckCheck, Trash2, Flag, Lock, ShieldCheck, AlertTriangle } from 'lucide-react';
+import { Smile, Reply, CheckCheck, Trash2, Flag, Lock, ShieldCheck, AlertTriangle, Forward, Pencil, X, Star } from 'lucide-react';
 
 const QUICK_EMOJIS = ['❤️', '👍', '🔥', '😂', '🎉', '😮'];
 
-export default function MessageBubble({ message, roomId, onReply, onDeleteMessage, onReportMessage }) {
+// Highlights the first occurrence of a search query inside a text body.
+function Highlight({ text, query }) {
+  if (!query || !text) return text || '';
+  const haystack = String(text);
+  const q = String(query).toLowerCase();
+  const idx = haystack.toLowerCase().indexOf(q);
+  if (idx === -1) return haystack;
+  return (
+    <>
+      {haystack.slice(0, idx)}
+      <mark style={{ background: '#facc15', color: '#0f172a', borderRadius: '3px', padding: '0 2px' }}>
+        {haystack.slice(idx, idx + q.length)}
+      </mark>
+      {haystack.slice(idx + q.length)}
+    </>
+  );
+}
+
+export default function MessageBubble({
+  message,
+  roomId,
+  onReply,
+  onEditMessage,
+  onDeleteMessage,
+  onDeleteForEveryone,
+  onForwardMessage,
+  onReportMessage,
+  onToggleStar,
+  highlightQuery
+}) {
   const { user } = useAuth();
   const { toggleReaction } = useSocket();
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -17,11 +46,13 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
 
   const isSentByMe = message.sender_id === user?.id;
   const reactions = message.reactions || {};
+  const isDeleted = message.type === 'deleted' || Boolean(message.deleted_for_everyone);
+  const isStarred = (message.starred_by || []).some(id => String(id) === String(user?.id));
 
   // Decrypted view of an E2EE message (falls back to raw fields for plaintext).
   const e2ee = Boolean(message.e2ee);
-  const bodyText = e2ee ? (message.decryptedText || (message.__undecryptable ? '' : '')) : message.text;
-  const mediaType = e2ee ? (message.decryptedType || null) : message.type;
+  const bodyText = e2ee ? (message.decryptedText || '') : (message.text || '');
+  const mediaType = e2ee ? (message.decryptedType || null) : (message.type || null);
   const mediaUrl = e2ee ? (message.decryptedMediaUrl || null) : (message.media_url || null);
   const mediaKey = e2ee ? (message.decryptedMediaKey || null) : null;
   const mediaNonce = e2ee ? (message.decryptedMediaNonce || null) : null;
@@ -31,6 +62,10 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
 
   // WhatsApp-style read receipts: blue double-check once someone else read it
   const readByOthers = (message.read_by || []).some(id => String(id) !== String(user?.id));
+
+  // Only text messages can be edited (media caption editing is out of scope).
+  const isTextMessage = e2ee ? !mediaUrl && !message.__undecryptable : message.type === 'text';
+  const isEditable = isSentByMe && isTextMessage && !isDeleted && !message.__replay;
 
   const handleEmojiClick = (emoji) => {
     toggleReaction(message.id, roomId, emoji);
@@ -52,7 +87,11 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
   });
 
   return (
-    <div className={`message-row ${isSentByMe ? 'sent' : 'received'}`} style={{ position: 'relative' }}>
+    <div
+      className={`message-row ${isSentByMe ? 'sent' : 'received'}`}
+      style={{ position: 'relative' }}
+      data-msg-id={message.id}
+    >
       {!isSentByMe && (
         <img
           src={message.sender_avatar || `https://api.dicebear.com/7.x/identicon/svg?seed=${message.sender_name}`}
@@ -65,6 +104,14 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         {/* Sender Name in Group Chats */}
         {!isSentByMe && message.sender_name && (
           <div className="sender-name-label">{message.sender_name}</div>
+        )}
+
+        {/* Forwarded label */}
+        {message.forwarded && (
+          <div className="forwarded-label">
+            <Forward size={12} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
+            Forwarded
+          </div>
         )}
 
         {/* Reply Preview Header */}
@@ -82,8 +129,49 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
           </div>
         )}
 
+        {/* Status Reply Quote (replied to someone's story) */}
+        {message.status_reply && (
+          <div style={{
+            background: 'rgba(0, 0, 0, 0.25)',
+            borderLeft: '3px solid #25d366',
+            padding: '0.35rem 0.6rem',
+            borderRadius: '6px',
+            marginBottom: '0.4rem',
+            fontSize: '0.75rem',
+            color: 'var(--text-muted)',
+            display: 'flex',
+            gap: '0.5rem',
+            alignItems: 'center'
+          }}>
+            {message.status_reply.media_url && message.status_reply.media_type !== 'video' && (
+              <img
+                src={message.status_reply.media_url}
+                alt=""
+                style={{ width: '36px', height: '36px', borderRadius: '6px', objectFit: 'cover', flexShrink: 0 }}
+              />
+            )}
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: '700', color: '#25d366' }}>Status reply</div>
+              {message.status_reply.text ? (
+                <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{message.status_reply.text}</div>
+              ) : (
+                <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {message.status_reply.media_type === 'video' ? '🎬 Video status' : '🖼️ Photo status'}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Deleted for everyone tombstone */}
+        {isDeleted && (
+          <div style={{ fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
+            🗑️ This message was deleted.
+          </div>
+        )}
+
         {/* Undecryptable E2EE placeholder (e.g. key not yet received) */}
-        {e2ee && message.__undecryptable && (
+        {!isDeleted && e2ee && message.__undecryptable && (
           <div style={{ fontSize: '0.85rem', fontStyle: 'italic', color: 'var(--text-muted)' }}>
             {message.__reason === 'auth' ? (
               <span>
@@ -97,7 +185,7 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         )}
 
         {/* Replay / duplicate message warning */}
-        {e2ee && message.__replay && (
+        {!isDeleted && e2ee && message.__replay && (
           <div style={{ fontSize: '0.8rem', fontStyle: 'italic', color: '#fbbf24', marginBottom: '0.25rem' }}>
             <AlertTriangle size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
             This message appears to be a replayed or duplicate copy and is not displayed.
@@ -105,7 +193,7 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         )}
 
         {/* Encrypted media - fetch + decrypt in the browser */}
-        {!message.__undecryptable && mediaUrl && mediaKey && mediaNonce && (
+        {!isDeleted && !message.__undecryptable && mediaUrl && mediaKey && mediaNonce && (
           <DecryptedMedia
             mediaUrl={mediaUrl}
             mediaKey={mediaKey}
@@ -117,7 +205,7 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         )}
 
         {/* Plaintext media content (Image Attachment) */}
-        {!mediaKey && mediaType === 'image' && mediaUrl && (
+        {!isDeleted && !mediaKey && mediaType === 'image' && mediaUrl && (
           <div style={{ marginBottom: '0.5rem' }}>
             <img
               src={mediaUrl}
@@ -128,7 +216,7 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         )}
 
         {/* Plaintext Video Attachment */}
-        {!mediaKey && mediaType === 'video' && mediaUrl && (
+        {!isDeleted && !mediaKey && mediaType === 'video' && mediaUrl && (
           <div style={{ marginBottom: '0.5rem' }}>
             <video
               src={mediaUrl}
@@ -139,13 +227,13 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         )}
 
         {/* Plaintext Voice Note Audio Player */}
-        {!mediaKey && mediaType === 'audio' && mediaUrl && (
+        {!isDeleted && !mediaKey && mediaType === 'audio' && mediaUrl && (
           <VoicePlayer audioUrl={mediaUrl} />
         )}
 
         {/* Text Body (plaintext + decrypted E2EE messages) */}
-        {!mediaUrl && !message.__undecryptable && (
-          <div>{bodyText || ''}</div>
+        {!isDeleted && !mediaUrl && !message.__undecryptable && (
+          <div><Highlight text={bodyText} query={highlightQuery} /></div>
         )}
 
         {/* Reactions List */}
@@ -179,13 +267,15 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
             </span>
           )}
           <span>{formattedTime}</span>
+          {isStarred && <Star size={11} fill="#facc15" style={{ color: '#facc15' }} />}
+          {message.edit_count > 0 && <span className="edited-label">edited</span>}
           {isSentByMe && (
             <CheckCheck size={14} style={{ color: readByOthers ? '#34b7f1' : '#8696a0' }} />
           )}
         </div>
       </div>
 
-      {/* Message Hover Actions (Reply, React, Delete) */}
+      {/* Message Hover Actions (React, Reply, Forward, Edit, Delete) */}
       <div style={{
         display: 'flex',
         gap: '0.2rem',
@@ -209,14 +299,52 @@ export default function MessageBubble({ message, roomId, onReply, onDeleteMessag
         >
           <Reply size={15} />
         </button>
-        {isSentByMe && (
+        {!isDeleted && (
+          <button
+            className="action-icon-btn"
+            style={{ width: '28px', height: '28px', border: 'none', background: 'transparent' }}
+            title="Forward message"
+            onClick={() => onForwardMessage(message)}
+          >
+            <Forward size={15} />
+          </button>
+        )}
+        <button
+          className="action-icon-btn"
+          style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: isStarred ? '#facc15' : 'var(--text-muted)' }}
+          title={isStarred ? 'Unstar message' : 'Star message'}
+          onClick={() => onToggleStar && onToggleStar(message)}
+        >
+          <Star size={15} fill={isStarred ? '#facc15' : 'none'} />
+        </button>
+        {isEditable && (
+          <button
+            className="action-icon-btn"
+            style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: '#38bdf8' }}
+            title="Edit message"
+            onClick={() => onEditMessage(message)}
+          >
+            <Pencil size={14} />
+          </button>
+        )}
+        {isSentByMe && !isDeleted && (
           <button
             className="action-icon-btn"
             style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: '#ef4444' }}
+            title="Delete for everyone"
+            onClick={() => onDeleteForEveryone(message.id)}
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+        {isSentByMe && !isDeleted && (
+          <button
+            className="action-icon-btn"
+            style={{ width: '28px', height: '28px', border: 'none', background: 'transparent', color: 'var(--text-muted)' }}
             title="Delete message for me"
             onClick={() => onDeleteMessage(message.id)}
           >
-            <Trash2 size={14} />
+            <X size={14} />
           </button>
         )}
         {!isSentByMe && (

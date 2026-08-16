@@ -162,31 +162,46 @@ C5. MessageList NO VIRTUALIZATION ........................ NOT RESOLVED
 SECTION D - DEPLOYMENT / VERCEL PARITY
 ================================================================================
 
-D1. api/index.js MISSING CLIENT ENDPOINTS ................ PARTIAL
-    Now present: POST /api/rooms/group (551), POST /api/rooms/bridge (578),
-    GET /api/rooms/:roomId/messages (602), DELETE /api/messages/:messageId (643),
-    PUT /api/rooms/:roomId/pin (588), PUT /api/users/theme (506),
-    POST /api/statuses (671), DELETE /api/statuses/:statusId (696).
-    STILL MISSING: POST /api/upload (no upload route exists in api/index.js).
-    Profile photo / image / voice-note uploads therefore still fail on Vercel.
+D1. api/index.js MISSING CLIENT ENDPOINTS ................ RESOLVED 15-Aug-2026
+    Full route parity with server/src/server.js completed. All routes that
+    existed in server.js are now present in api/index.js:
+      - DELETE /api/users (own account)
+      - GET/PUT /api/users/privacy, POST/DELETE /api/users/:userId/block,
+        GET /api/users/blocked
+      - GET /api/push/vapid-public-key, POST /api/push/subscribe
+      - POST /api/messages/:messageId/report
+      - GET /api/rooms/bridges
+      - PUT /api/messages/:messageId (edit), POST .../star,
+        GET /api/rooms/:roomId/starred, GET /api/rooms/:roomId/search
+      - POST /api/messages/:messageId/delete-everyone, POST /api/messages/forward
+      - PUT /api/rooms/:roomId/disappearing, PUT .../members/:userId/role,
+        DELETE .../members/:userId, POST .../leave, PUT /api/rooms/:roomId (edit)
+    Multipart upload parity added on PUT /api/users/profile, POST /api/rooms/group,
+    POST /api/messages, POST /api/statuses, PUT /api/rooms/:roomId.
+    Business rules mirrored: self/blocked checks, admin-only group operations,
+    last-admin auto-promote, disappearing-seconds whitelist, forward block checks.
+    Verified with a 37-assertion HTTP smoke test (37/37 pass).
+    (Line numbers in the old D1 audit predate this change and are stale.)
 
-D2. NO SOCKET.IO / NO MESSAGE SEND ON VERCEL ............ PARTIAL
-    REST fallback POST /api/messages exists server-side (api/index.js:611).
-    BUT the client never uses it: SocketContext.jsx:61-72 emits
-    'send_message' over the socket only. On Vercel there is no socket
-    server, so the UI still cannot send messages.
-    -> In SocketContext.sendMessage(), if socket is missing/disconnected,
-       POST to /api/messages instead.
+D2. NO SOCKET.IO / NO MESSAGE SEND ON VERCEL ............ RESOLVED 15-Aug-2026
+    REST fallback POST /api/messages exists server-side (api/index.js).
+    Client now uses it: SocketContext.sendMessage() falls back to POST
+    /api/messages when the socket is missing/disconnected, returns the created
+    message, and ChatComposer forwards it via onMessageDelivered so App.jsx
+    decrypts + appends the sender's own message (no socket echo needed).
+    Note: real-time presence/typing/read-receipts still need a persistent Node
+    host - Vercel serverless remains send/receive-capable but not live.
 
 D3. HARDCODED https://pulse-room-chat-app.vercel.app ...... RESOLVED
     All links now use process.env.APP_URL (api/index.js:285,335,738).
     No hardcoded Vercel URL remains (verified by grep).
 
-D4. /uploads NOT SERVED ON VERCEL ....................... NOT RESOLVED
-    api/index.js has no static /uploads handler and no upload endpoint
-    (see D1). Files would appear broken in production.
-    -> Requires a blob/object store (e.g. Supabase Storage) since serverless
-       disk writes do not persist anyway.
+D4. /uploads NOT SERVED ON VERCEL ....................... RESOLVED 15-Aug-2026
+    /api/upload exists and returns in-memory data: URLs (multer memoryStorage).
+    All media routes now accept uploads (profile/group/messages/statuses/room
+    edit). On the Vercel flow the client never receives /uploads/... paths, so
+    no static handler is needed. (Long-term blob store still recommended if
+    media should outlive a cold start - see deployment.txt.)
 
 D5. UPLOADS DIR DEPENDS ON CWD .......................... RESOLVED
     server.js:133 -> path.resolve(process.cwd(), 'uploads').
