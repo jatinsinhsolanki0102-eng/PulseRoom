@@ -440,6 +440,17 @@ async function loadMarkedUnreadForUser(userId) {
 export const db = {
   isPgConnected: () => isPgConnected,
 
+  // Live connectivity check (unlike isPgConnected, this actually queries PG)
+  ping: async () => {
+    if (!isPgConnected) return { connected: false, reason: 'Postgres not connected at boot' };
+    try {
+      await pool.query('SELECT 1');
+      return { connected: true };
+    } catch (e) {
+      return { connected: false, reason: e.message };
+    }
+  },
+
   // User Operations
   createUser: async ({ username, email, passwordHash, avatarUrl, bio, emailConfirmed = true }) => {
     const id = uuidv4();

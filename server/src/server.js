@@ -363,7 +363,22 @@ app.get('/api/email/diag', async (req, res) => {
     probes.push({ target: `${c.label} (${ip})`, port, ...(await tcpProbe(ip, port)) });
   }
 
-  // 2. Full authenticated SMTP send
+  // 2. HTTPS egress probe (fetch) + live DB ping. If HTTPS egress works but raw
+  // TCP SMTP does not, an HTTPS API provider (Resend) is the reliable path.
+  const httpsProbe = {};
+  try {
+    const resp = await fetch('https://api.resend.com/', { method: 'GET', signal: AbortSignal.timeout(12000) });
+    const text = await resp.text();
+    httpsProbe.ok = true;
+    httpsProbe.status = resp.status;
+    httpsProbe.detail = text.slice(0, 120);
+  } catch (e) {
+    httpsProbe.ok = false;
+    httpsProbe.error = e.message;
+  }
+  const dbPing = await db.ping();
+
+  // 3. Full authenticated SMTP send
   const results = [];
   if (gmailUser && gmailPass) {
     const smtpHost = await resolveGmailIpv4();
@@ -417,7 +432,7 @@ app.get('/api/email/diag', async (req, res) => {
   }
 
   lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
-  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, probes, results });
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
