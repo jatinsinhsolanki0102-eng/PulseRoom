@@ -1,6 +1,11 @@
 ===============================================================================
  PULSEROOM - DEPLOYMENT SOLUTION (FREE, NO PLATFORM COST)
  Date: 14-Aug-2026
+ Updated: 16-Aug-2026 - >>> DEPLOYED & LIVE <<<
+   Render service  : pulseroom  ->  https://pulseroom-jtaj.onrender.com
+   Supabase project: PulseRoom  ->  db.nnqudmojouzodgbemukp.supabase.co
+   Status          : Connected to PostgreSQL (session pooler) - durable.
+   Verified in log : "Connected to PostgreSQL database successfully."
 ===============================================================================
 MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
   + Supabase (free) Postgres for durable data.
@@ -51,6 +56,14 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
   Verified: server test suite still passes (14/14). No further code changes
   are needed. Everything below is just settings.
 
+  IMPORTANT (16-Aug-2026): Render applies env vars during the build too, so
+  NODE_ENV=production makes `npm install` skip dev-dependencies and the client
+  build fails with "vite: not found". The client install MUST use
+  `npm install --include=dev`:
+
+      Build Command:
+      cd server && npm install && cd ../client && npm install --include=dev && npm run build
+
   (If you refuse any code change: deploy client/dist as a Render Static Site
    and the server as a second Web Service - but then the client must also be
    told the backend URL, which is MORE changes, and real-time needs a socket
@@ -86,18 +99,23 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
   2. Service settings:
        Name:            pulseroom
        Region:          any (nearest to your users)
-       Build Command:   cd server && npm install && cd ../client && npm install && npm run build
-       Start Command:   node src/server.js
+       Build Command:   cd server && npm install && cd ../client && npm install --include=dev && npm run build
+                        (--include=dev is REQUIRED: with NODE_ENV=production Render
+                         skips dev-dependencies during the build and the client
+                         build then fails with "vite: not found")
+       Start Command:   cd server && node src/server.js
+                        (Render runs commands from the REPO ROOT, so the server's
+                         src/ must be entered via `cd server` first)
        Instance Type:   Free
-  3. Environment Variables (Project/Settings -> Environment) - THE CRITICAL PART:
+   3. Environment Variables (Project/Settings -> Environment) - THE CRITICAL PART:
        NODE_ENV              = production          (turns on PG SSL - required by Supabase)
-       DATABASE_URL          = postgresql://...    (Supabase connection string)
+       DATABASE_URL          = postgresql://...    (Supabase SESSION POOLER string - see below)
        JWT_SECRET            = <a long random string>  (REQUIRED - server refuses to
-                                                       start without it in prod)
+                                                        start without it in prod)
        GMAIL_USER            = your@gmail.com      (for email confirmations)
        GMAIL_APP_PASS        = <16-char Gmail app password>  (free, enable 2FA -> app pass)
-       CLIENT_URL            = https://pulseroom.onrender.com
-       APP_URL               = https://pulseroom.onrender.com
+       CLIENT_URL            = https://pulseroom-jtaj.onrender.com
+       APP_URL               = https://pulseroom-jtaj.onrender.com
        VAPID_PUBLIC_KEY      = <paste the public key from data/.vapid.json>
        VAPID_PRIVATE_KEY     = <paste the private key from data/.vapid.json>
        PUSH_CONTACT_EMAIL    = admin@example.com
@@ -105,10 +123,24 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
      data/ is wiped on redeploys. Without fixed VAPID keys, every redeploy
      invalidates all users' push subscriptions.
 
+  DATABASE_URL - SUPABASE CONNECTION METHOD (learned the hard way):
+  - Use the SESSION POOLER string, NOT the "Direct connection":
+        postgresql://postgres.nnqudmojouzodgbemukp:PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres
+  - Why: Supabase direct connections are IPv6-first. Render's free tier has no
+    IPv6 route, so the direct host fails with ENETUNREACH and the server falls
+    back to the in-memory DB (data lost on every redeploy). The session pooler
+    is IPv4 and works. The "Transaction pooler" (port 6543) also works if the
+    session pooler is ever unavailable.
+  - Password tips: avoid special characters in the DB password entirely
+    (@#$% break the URL - '@' must be encoded as %40). If you change the
+    password, update DATABASE_URL too.
+  - Code fix already in place (server/src/db.js): dns.setDefaultResultOrder
+    ('ipv4first') + family:4 so IPv4-capable hosts are used where available.
+
 ------------------------------------------------------------------------------
  4. AFTER DEPLOY - CHECKLIST
 ------------------------------------------------------------------------------
-  - Open https://pulseroom.onrender.com -> register -> confirm email.
+  - Open https://pulseroom-jtaj.onrender.com -> register -> confirm email.
   - Register a second account (2nd browser/incognito) -> message each other
     -> messages appear live on BOTH sides (proves Socket.IO works).
   - Push a small git change -> wait for redeploy -> log in again with the SAME
