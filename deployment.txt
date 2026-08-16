@@ -111,9 +111,14 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
        NODE_ENV              = production          (turns on PG SSL - required by Supabase)
        DATABASE_URL          = postgresql://...    (Supabase SESSION POOLER string - see below)
        JWT_SECRET            = <a long random string>  (REQUIRED - server refuses to
-                                                        start without it in prod)
-       GMAIL_USER            = your@gmail.com      (for email confirmations)
-       GMAIL_APP_PASS        = <16-char Gmail app password>  (free, enable 2FA -> app pass)
+                                                         start without it in prod)
+       GMAIL_USER            = your@gmail.com      (email confirmations - LOCAL dev only,
+                                                    see EMAIL SENDING note below)
+       GMAIL_APP_PASS        = <16-char Gmail app password>  (LOCAL dev only)
+       RESEND_API_KEY        = <your Resend API key>  (REQUIRED for email on Render - see
+                                                       EMAIL SENDING note below)
+       RESEND_FROM           = "PulseRoom <no-reply@your-verified-domain.com>"
+                                                    (REQUIRED for email on Render)
        CLIENT_URL            = https://pulseroom-jtaj.onrender.com
        APP_URL               = https://pulseroom-jtaj.onrender.com
        VAPID_PUBLIC_KEY      = <paste the public key from data/.vapid.json>
@@ -122,6 +127,32 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
      NOTE: JWT_SECRET and the VAPID keys MUST be env vars (not files), because
      data/ is wiped on redeploys. Without fixed VAPID keys, every redeploy
      invalidates all users' push subscriptions.
+
+  EMAIL SENDING - WHY IT FAILED ON RENDER AND THE FIX (16-Aug-2026):
+  - Root cause (proven via /api/email/diag): Google blackholes Render's free-tier
+    egress IPs AT THE NETWORK LEVEL. Raw TCP probes from the deployed server to
+    smtp.gmail.com on ports 465/587/25 all time out, and even google.com:443 and
+    Gmail:443 time out, while api.resend.com (Cloudflare) and Supabase connect
+    instantly. Gmail SMTP can therefore NEVER deliver from Render free - it is not
+    an IP/port/code issue.
+  - Fix: email is now sent via the Resend HTTPS API (already in the code, works
+    from Render - same kind of HTTPS traffic as the app itself). The server
+    fast-skips Gmail (3s probe) when it is unreachable and uses Resend instead.
+  - TO ACTIVATE EMAIL ON RENDER (2 env vars + 1 Resend setup):
+      1. Add RESEND_API_KEY (the one already in server/.env) to Render env.
+      2. On resend.com verify a domain (Settings -> Domains -> add -> follow the
+         DNS records) so you can send to ANY user, then set:
+         RESEND_FROM = PulseRoom <no-reply@your-domain.com>
+         (Without a verified domain, Resend's onboarding@resend.dev sender can
+          only deliver to YOUR OWN account email - fine for testing, useless for
+          real users.)
+      3. Optional: RESEND_DIAG_TO = <your email> so GET /api/email/diag can also
+         test the Resend path.
+  - Gmail SMTP stays as a fallback: it still works for local dev (your PC can reach
+    Gmail) and will be used automatically if the server CAN reach smtp.gmail.com.
+  - Diagnostics: GET /api/email/diag (live SMTP send + raw TCP probes + HTTPS
+    egress + DB ping), and GET /api/health shows the lastEmailError.
+
 
   DATABASE_URL - SUPABASE CONNECTION METHOD (learned the hard way):
   - Use the SESSION POOLER string, NOT the "Direct connection":
