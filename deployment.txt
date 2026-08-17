@@ -1,7 +1,7 @@
 ===============================================================================
  PULSEROOM - DEPLOYMENT SOLUTION (FREE, NO PLATFORM COST)
- Date: 14-Aug-2026
- Updated: 16-Aug-2026 - >>> DEPLOYED & LIVE <<<
+  Date: 14-Aug-2026
+  Updated: 17-Aug-2026 - >>> DEPLOYED & LIVE <<<
    Render service  : pulseroom  ->  https://pulseroom-jtaj.onrender.com
    Supabase project: PulseRoom  ->  db.nnqudmojouzodgbemukp.supabase.co
    Status          : Connected to PostgreSQL (session pooler) - durable.
@@ -112,21 +112,23 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
        DATABASE_URL          = postgresql://...    (Supabase SESSION POOLER string - see below)
        JWT_SECRET            = <a long random string>  (REQUIRED - server refuses to
                                                          start without it in prod)
-        GMAIL_USER            = your@gmail.com      (email confirmations - LOCAL dev only,
-                                                     see EMAIL SENDING note below)
-        GMAIL_APP_PASS        = <16-char Gmail app password>  (LOCAL dev only)
-        BREVO_API_KEY         = <your Brevo key>    (REQUIRED for email on Render -
-                                                     BEST free path, no domain needed,
-                                                     300 emails/day)
-        BREVO_FROM            = "PulseRoom <you@verified-email.com>"
-                                                     (sender you verified in Brevo)
-        SENDGRID_API_KEY      = <your SendGrid key>  (alternative, no domain needed,
-                                                      100 emails/day)
-        SENDGRID_FROM         = "PulseRoom <you@verified-email.com>"
-                                                     (sender you verified in SendGrid)
-        RESEND_API_KEY        = <your Resend API key>  (alternative, needs a verified
-                                                        domain)
-        RESEND_FROM           = "PulseRoom <no-reply@your-verified-domain.com>"
+         GMAIL_USER            = your@gmail.com      (email confirmations - LOCAL dev only,
+                                                      see EMAIL SENDING note below)
+         GMAIL_APP_PASS        = <16-char Gmail app password>  (LOCAL dev only)
+         BREVO_API_KEY         = <your Brevo key>    (alternative, 300 emails/day,
+                                                      needs account activation)
+         BREVO_FROM            = "PulseRoom <you@verified-email.com>"
+         MAILJET_API_KEY       = <your Mailjet public key>  (BEST free path - activates
+                                                      instantly, no domain needed,
+                                                      6,000 emails/month)
+         MAILJET_SECRET_KEY    = <your Mailjet secret key>
+         MAILJET_FROM          = "PulseRoom <you@verified-email.com>"
+         SENDGRID_API_KEY      = <your SendGrid key>  (alternative, no domain needed,
+                                                       100 emails/day)
+         SENDGRID_FROM         = "PulseRoom <you@verified-email.com>"
+         RESEND_API_KEY        = <your Resend API key>  (alternative, needs a verified
+                                                         domain)
+         RESEND_FROM           = "PulseRoom <no-reply@your-verified-domain.com>"
        CLIENT_URL            = https://pulseroom-jtaj.onrender.com
        APP_URL               = https://pulseroom-jtaj.onrender.com
        VAPID_PUBLIC_KEY      = <paste the public key from data/.vapid.json>
@@ -136,37 +138,50 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
      data/ is wiped on redeploys. Without fixed VAPID keys, every redeploy
      invalidates all users' push subscriptions.
 
-  EMAIL SENDING - WHY IT FAILED ON RENDER AND THE FIX (16-Aug-2026):
+  EMAIL SENDING - WHY IT FAILED ON RENDER AND THE FIX (17-Aug-2026):
   - Root cause (proven via /api/email/diag): Google blackholes Render's free-tier
     egress IPs AT THE NETWORK LEVEL. Raw TCP probes from the deployed server to
     smtp.gmail.com on ports 465/587/25 all time out, and even google.com:443 and
     Gmail:443 time out, while api.resend.com (Cloudflare) and Supabase connect
     instantly. Gmail SMTP can therefore NEVER deliver from Render free - it is not
     an IP/port/code issue.
+  - CURRENT STATUS (17-Aug-2026):
+    * Mailjet: CONFIGURED and ACTIVE - sends emails to any recipient. 6,000/month free.
+    * Brevo: CONFIGURED but NOT ACTIVATED - new accounts need activation.
+      Email contact@brevo.com or wait 24-48h for automatic activation.
+    * SendGrid: NOT CONFIGURED (no API key set in Render env).
+    * Resend: CONFIGURED but limited - without a verified domain, can only
+      send to the account owner's own email (230390116025@saffrony.ac.in).
+    * Gmail SMTP: Never works from Render (Google blocks Render IPs).
+  - Dispatcher tries each provider in order until one succeeds:
+      Gmail (skipped) -> Brevo -> Mailjet -> SendGrid -> Resend
    - Fix: email is sent via HTTPS APIs instead of raw SMTP. The dispatcher order is:
-       Gmail SMTP  ->  Brevo API  ->  SendGrid API  ->  Resend API
+       Gmail SMTP  ->  Brevo API  ->  Mailjet API  ->  SendGrid API  ->  Resend API
      Gmail is fast-skipped when unreachable (3s probe) so it never wastes time on
-     Render. Brevo/SendGrid/Resend run over HTTPS, which works from Render.
-   - BEST FREE PATH (no domain needed): Brevo (Sendinblue). Verify only a SENDER
-     EMAIL (no domain/DNS), then add to Render env:
+     Render. All API providers run over HTTPS, which works from Render.
+   - BEST FREE PATH (no domain needed): Mailjet. Verify only a SENDER EMAIL
+     (no domain/DNS), account activates instantly, then add to Render env:
+        MAILJET_API_KEY    = <your public key from app.mailjet.com -> API -> API Keys>
+        MAILJET_SECRET_KEY = <your secret key>
+        MAILJET_FROM       = "PulseRoom <you@verified-email.com>"  (must match the
+                             email you verified in Mailjet)
+     Free tier: 6,000 emails/month - most generous free tier.
+   - Alternative (no domain needed): Brevo (Sendinblue). Free 300 emails/day.
+     BUT: new accounts need activation (email contact@brevo.com or wait 24-48h).
         BREVO_API_KEY = <your key from app.brevo.com -> Settings -> API Keys>
-        BREVO_FROM    = "PulseRoom <you@verified-email.com>"  (must match the
-                        email you verified in Brevo)
-     Free tier: 300 emails/day - most generous free tier.
-   - Alternative (no domain needed): SendGrid. Verify only a SENDER EMAIL, then:
+        BREVO_FROM    = "PulseRoom <you@verified-email.com>"
+   - Alternative (no domain needed): SendGrid. Free 100 emails/day.
         SENDGRID_API_KEY = <your key from app.sendgrid.com>
         SENDGRID_FROM    = "PulseRoom <you@verified-email.com>"
-     Free tier: 100 emails/day.
    - Alternative: Resend. Needs a VERIFIED DOMAIN (you must own one and add DNS
-     records). Add to Render env:
+     records). Without a verified domain, Resend's onboarding@resend.dev sender
+     can only deliver to YOUR OWN account email - useless for real users.
         RESEND_API_KEY = <your key from resend.com>
         RESEND_FROM    = "PulseRoom <no-reply@your-domain.com>"
-     Without a verified domain, Resend's onboarding@resend.dev sender can only
-     deliver to YOUR OWN account email - useless for real users.
    - Gmail SMTP stays as a fallback for local dev only (your PC can reach Gmail).
    - Diagnostics: GET /api/email/diag (live SMTP send + raw TCP probes + HTTPS
-     egress + DB ping + Brevo/SendGrid/Resend tests), and GET /api/health shows
-     the lastEmailError and which providers are configured.
+     egress + DB ping + Brevo/Mailjet/SendGrid/Resend tests), and GET /api/health
+     shows the lastEmailError and which providers are configured.
 
   ------------------------------------------------------------------------------
   SENDGRID SETUP - STEP-BY-STEP (~10 minutes, no domain needed)
@@ -238,6 +253,45 @@ MY RECOMMENDATION: ONE Render Web Service running the FULL Node app
       rejects with 400 (unverified sender).
     - Optional: BREVO_DIAG_TO = <your email> so GET /api/email/diag can test
       the Brevo path from the browser.
+
+  ------------------------------------------------------------------------------
+  MAILJET SETUP - STEP-BY-STEP (~5 minutes, no domain needed)  >>> RECOMMENDED <<<
+  ------------------------------------------------------------------------------
+  BEST FREE OPTION: 6,000 emails/month (200/day), no domain needed,
+  account activates instantly, reliable HTTPS API.
+
+  STEP 1 - Mailjet account (app.mailjet.com)
+    1. Sign up free (email + password). Verify your account via the email they
+       send. Free plan is sufficient (no card required).
+    2. Verify a sender email - NO domain needed:
+       - Account Settings -> Sender Addresses -> Add a Sender
+       - Enter your name + your email (e.g. 230390116025@saffrony.ac.in)
+       - Select "Both / I don't know" for email type
+       - Mailjet emails you a confirmation link -> click it.  DONE
+    3. Get API keys:
+       - API -> API Key Management
+       - Click on your Primary API Key to reveal the full key (starts with 613e...)
+       - Click "Not generated" next to Secret Key to generate it
+       - Copy both the API Key and Secret Key
+
+  STEP 2 - Add to Render env vars (Render dashboard -> your service -> Environment)
+       MAILJET_API_KEY    = <the full API key from step 1.3>
+       MAILJET_SECRET_KEY = <the secret key from step 1.3>
+       MAILJET_FROM       = "PulseRoom <the-email-you-verified>"  (must match
+                            EXACTLY what you verified in step 1.2)
+    Save -> Render redeploys automatically.
+
+  STEP 3 - Verify it works
+      1. Open https://pulseroom-jtaj.onrender.com/api/health
+         -> should show "mailjetConfigured": true.
+      2. Register a new test account -> you should get the confirmation email.
+
+  NOTES:
+    - Free tier = 6,000 emails/month (~200/day). Most generous free option.
+    - MAILJET_FROM must be the exact sender email you verified, or Mailjet
+      rejects with 400 (unverified sender).
+    - Optional: MAILJET_DIAG_TO = <your email> so GET /api/email/diag can test
+      the Mailjet path from the browser.
 
 
   DATABASE_URL - SUPABASE CONNECTION METHOD (learned the hard way):
