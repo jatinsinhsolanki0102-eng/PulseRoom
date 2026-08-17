@@ -159,7 +159,47 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 2: SendGrid API (free tier, NO domain needed - only a verified
+  // Priority 2: Brevo (Sendinblue) API - free 300 emails/day, NO domain needed,
+  // only a verified sender email. Pure HTTPS so it works from Render where
+  // Google SMTP is blackholed, and it delivers to ANY recipient.
+  const brevoKey = (process.env.BREVO_API_KEY || '').trim();
+  const brevoFromRaw = (process.env.BREVO_FROM || '').trim();
+  if (brevoKey && brevoFromRaw) {
+    console.log(`🔄 Dispatching via Brevo API...`);
+    try {
+      const sender = parseSender(brevoFromRaw);
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'api-key': brevoKey,
+          'Content-Type': 'application/json',
+          'accept': 'application/json'
+        },
+        body: JSON.stringify({
+          sender: { name: sender.name || 'PulseRoom', email: sender.email },
+          to: [{ email: to }],
+          subject,
+          htmlContent: htmlText || '',
+          textContent: plainText || ''
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (response.ok) {
+        const resData = await response.json().catch(() => ({}));
+        lastEmailError = '';
+        console.log(`✅ BREVO EMAIL DELIVERED TO ${to}! MessageID: ${resData.messageId}`);
+        return { success: true, provider: 'brevo', messageId: resData.messageId || `brevo-${Date.now()}` };
+      }
+      const resData = await response.json().catch(() => ({}));
+      lastEmailError = `Brevo API: HTTP ${response.status} ${JSON.stringify(resData.message || resData).slice(0, 300)}`;
+      console.warn('⚠️ Brevo API notice:', response.status, resData);
+    } catch (bErr) {
+      lastEmailError = `Brevo API: ${bErr.message}`;
+      console.warn('⚠️ Brevo API Exception:', bErr.message);
+    }
+  }
+
+  // Priority 3: SendGrid API (free tier, NO domain needed - only a verified
   // sender email). Pure HTTPS so it works from Render where Google SMTP is
   // blackholed, and it delivers to ANY recipient.
   const sgKey = (process.env.SENDGRID_API_KEY || '').trim();
@@ -198,7 +238,7 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 3: Resend API
+  // Priority 4: Resend API
   if (resendKey) {
     console.log(`🔄 Dispatching via Resend API...`);
     try {
@@ -234,7 +274,7 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
 
   return {
     success: false,
-    error: lastEmailError || 'Email delivery failed. Please check GMAIL_USER / GMAIL_APP_PASS in server/.env.'
+    error: lastEmailError || 'Email delivery failed. No email provider is configured. Add BREVO_API_KEY, SENDGRID_API_KEY, or RESEND_API_KEY in the server environment.'
   };
 }
 
@@ -359,6 +399,7 @@ app.get('/api/health', (req, res) => {
     pgConnected: db.isPgConnected(),
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
     sendgridConfigured: Boolean(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM),
+    brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.BREVO_FROM),
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
     lastEmailError: lastEmailError,
     timestamp: new Date().toISOString()
@@ -394,8 +435,8 @@ app.get('/api/email/diag', async (req, res) => {
   const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-  if (!gmailUser && !resendKey) {
-    return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS or RESEND_API_KEY.' });
+  if (!gmailUser && !resendKey && !((process.env.BREVO_API_KEY || '').trim()) && !((process.env.SENDGRID_API_KEY || '').trim())) {
+    return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS, BREVO_API_KEY, SENDGRID_API_KEY, or RESEND_API_KEY.' });
   }
 
   // 1. Raw TCP probes
@@ -473,7 +514,7 @@ app.get('/api/email/diag', async (req, res) => {
   // 4. SendGrid send test (HTTPS API - works on Render without a domain)
   const sgKey = (process.env.SENDGRID_API_KEY || '').trim();
   const sgFromRaw = (process.env.SENDGRID_FROM || '').trim();
-  const sgDiagTo = process.env.SENDGRID_DIAG_TO || process.env.RESEND_DIAG_TO || gmailUser;
+  const sgDiagTo = process.env.SENDGRID_DIAG_TO || process.env.RESEND_DIAG_TO || process.env.BREVO_DIAG_TO || gmailUser;
   if (sgKey && sgFromRaw && sgDiagTo) {
     try {
       const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -495,6 +536,36 @@ app.get('/api/email/diag', async (req, res) => {
       }
     } catch (err) {
       results.push({ provider: 'sendgrid', ok: false, error: err.message });
+    }
+  }
+
+  // 4b. Brevo (Sendinblue) send test (HTTPS API - free 300/day, no domain needed)
+  const brevoKey = (process.env.BREVO_API_KEY || '').trim();
+  const brevoFromRaw = (process.env.BREVO_FROM || '').trim();
+  const brevoDiagTo = process.env.BREVO_DIAG_TO || process.env.RESEND_DIAG_TO || process.env.SENDGRID_DIAG_TO || gmailUser;
+  if (brevoKey && brevoFromRaw && brevoDiagTo) {
+    try {
+      const sender = parseSender(brevoFromRaw);
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': brevoKey, 'Content-Type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          sender: { name: sender.name || 'PulseRoom', email: sender.email },
+          to: [{ email: brevoDiagTo }],
+          subject: 'PulseRoom email diagnostics test',
+          htmlContent: '<b>If you can read this, PulseRoom email sending works.</b>',
+          textContent: 'If you can read this, PulseRoom email sending works.'
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      const resData = await response.json().catch(() => ({}));
+      if (response.ok) {
+        results.push({ provider: 'brevo', ok: true, messageId: resData.messageId });
+      } else {
+        results.push({ provider: 'brevo', ok: false, error: JSON.stringify(resData.message || resData).slice(0, 300) });
+      }
+    } catch (err) {
+      results.push({ provider: 'brevo', ok: false, error: err.message });
     }
   }
 
@@ -521,7 +592,7 @@ app.get('/api/email/diag', async (req, res) => {
   }
 
   lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
-  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), sendgrid: Boolean(sgKey && sgFromRaw), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), sendgrid: Boolean(sgKey && sgFromRaw), brevo: Boolean(brevoKey && brevoFromRaw), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
