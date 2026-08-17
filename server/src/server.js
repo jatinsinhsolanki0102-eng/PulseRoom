@@ -199,7 +199,48 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 3: SendGrid API (free tier, NO domain needed - only a verified
+  // Priority 3: Mailjet API - free 6,000 emails/month, NO domain needed,
+  // only a verified sender email. Pure HTTPS, works from Render.
+  const mailjetKey = (process.env.MAILJET_API_KEY || '').trim();
+  const mailjetSecret = (process.env.MAILJET_SECRET_KEY || '').trim();
+  const mailjetFromRaw = (process.env.MAILJET_FROM || '').trim();
+  if (mailjetKey && mailjetSecret && mailjetFromRaw) {
+    console.log(`🔄 Dispatching via Mailjet API...`);
+    try {
+      const sender = parseSender(mailjetFromRaw);
+      const response = await fetch('https://api.mailjet.com/v3.1/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${mailjetKey}:${mailjetSecret}`).toString('base64'),
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          Messages: [{
+            From: { Email: sender.email, Name: sender.name || 'PulseRoom' },
+            To: [{ Email: to }],
+            Subject: subject,
+            HTMLPart: htmlText || '',
+            TextPart: plainText || ''
+          }]
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      const resData = await response.json();
+      if (response.ok && resData.Sent) {
+        lastEmailError = '';
+        console.log(`✅ MAILJET EMAIL DELIVERED TO ${to}! MessageID: ${resData.Sent[0]?.MessageID}`);
+        return { success: true, provider: 'mailjet', messageId: String(resData.Sent[0]?.MessageID || `mailjet-${Date.now()}`) };
+      }
+      const errMsg = resData.Messages?.[0]?.Errors?.[0]?.ErrorMessage || JSON.stringify(resData);
+      lastEmailError = `Mailjet API: HTTP ${response.status} ${String(errMsg).slice(0, 300)}`;
+      console.warn('⚠️ Mailjet API notice:', response.status, errMsg);
+    } catch (mErr) {
+      lastEmailError = `Mailjet API: ${mErr.message}`;
+      console.warn('⚠️ Mailjet API Exception:', mErr.message);
+    }
+  }
+
+  // Priority 4: SendGrid API (free tier, NO domain needed - only a verified
   // sender email). Pure HTTPS so it works from Render where Google SMTP is
   // blackholed, and it delivers to ANY recipient.
   const sgKey = (process.env.SENDGRID_API_KEY || '').trim();
@@ -238,7 +279,7 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
     }
   }
 
-  // Priority 4: Resend API
+  // Priority 5: Resend API
   if (resendKey) {
     console.log(`🔄 Dispatching via Resend API...`);
     try {
@@ -274,7 +315,7 @@ async function sendEmailImpl({ to, subject, htmlText, plainText }) {
 
   return {
     success: false,
-    error: lastEmailError || 'Email delivery failed. No email provider is configured. Add BREVO_API_KEY, SENDGRID_API_KEY, or RESEND_API_KEY in the server environment.'
+    error: lastEmailError || 'Email delivery failed. No email provider is configured. Add BREVO_API_KEY, MAILJET_API_KEY, SENDGRID_API_KEY, or RESEND_API_KEY in the server environment.'
   };
 }
 
@@ -400,6 +441,7 @@ app.get('/api/health', (req, res) => {
     resendConfigured: Boolean(process.env.RESEND_API_KEY),
     sendgridConfigured: Boolean(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM),
     brevoConfigured: Boolean(process.env.BREVO_API_KEY && process.env.BREVO_FROM),
+    mailjetConfigured: Boolean(process.env.MAILJET_API_KEY && process.env.MAILJET_SECRET_KEY && process.env.MAILJET_FROM),
     gmailConfigured: Boolean(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS),
     lastEmailError: lastEmailError,
     timestamp: new Date().toISOString()
@@ -435,8 +477,8 @@ app.get('/api/email/diag', async (req, res) => {
   const gmailPass = (process.env.GMAIL_APP_PASS || '').replace(/\s+/g, '');
   const resendKey = (process.env.RESEND_API_KEY || '').trim();
 
-  if (!gmailUser && !resendKey && !((process.env.BREVO_API_KEY || '').trim()) && !((process.env.SENDGRID_API_KEY || '').trim())) {
-    return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS, BREVO_API_KEY, SENDGRID_API_KEY, or RESEND_API_KEY.' });
+  if (!gmailUser && !resendKey && !((process.env.BREVO_API_KEY || '').trim()) && !((process.env.SENDGRID_API_KEY || '').trim()) && !((process.env.MAILJET_API_KEY || '').trim())) {
+    return res.status(400).json({ error: 'No email provider configured. Set GMAIL_USER/GMAIL_APP_PASS, BREVO_API_KEY, SENDGRID_API_KEY, MAILJET_API_KEY, or RESEND_API_KEY.' });
   }
 
   // 1. Raw TCP probes
@@ -569,6 +611,43 @@ app.get('/api/email/diag', async (req, res) => {
     }
   }
 
+  // 4c. Mailjet send test (HTTPS API - free 6,000/month, no domain needed)
+  const mjKey = (process.env.MAILJET_API_KEY || '').trim();
+  const mjSecret = (process.env.MAILJET_SECRET_KEY || '').trim();
+  const mjFromRaw = (process.env.MAILJET_FROM || '').trim();
+  const mjDiagTo = process.env.MAILJET_DIAG_TO || process.env.BREVO_DIAG_TO || process.env.RESEND_DIAG_TO || process.env.SENDGRID_DIAG_TO || gmailUser;
+  if (mjKey && mjSecret && mjFromRaw && mjDiagTo) {
+    try {
+      const sender = parseSender(mjFromRaw);
+      const response = await fetch('https://api.mailjet.com/v3.1/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${mjKey}:${mjSecret}`).toString('base64'),
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          Messages: [{
+            From: { Email: sender.email, Name: sender.name || 'PulseRoom' },
+            To: [{ Email: mjDiagTo }],
+            Subject: 'PulseRoom email diagnostics test',
+            HTMLPart: '<b>If you can read this, PulseRoom email sending works.</b>',
+            TextPart: 'If you can read this, PulseRoom email sending works.'
+          }]
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      const resData = await response.json().catch(() => ({}));
+      if (response.ok && resData.Sent) {
+        results.push({ provider: 'mailjet', ok: true, messageId: resData.Sent[0]?.MessageID });
+      } else {
+        const errMsg = resData.Messages?.[0]?.Errors?.[0]?.ErrorMessage || JSON.stringify(resData);
+        results.push({ provider: 'mailjet', ok: false, error: String(errMsg).slice(0, 300) });
+      }
+    } catch (err) {
+      results.push({ provider: 'mailjet', ok: false, error: err.message });
+    }
+  }
+
   // 5. Resend send test
   if (resendKey && (process.env.RESEND_DIAG_TO || gmailUser)) {
     const diagTo = process.env.RESEND_DIAG_TO || gmailUser;
@@ -592,7 +671,7 @@ app.get('/api/email/diag', async (req, res) => {
   }
 
   lastEmailError = results.find(r => r.ok) ? '' : (results.map(r => r.error).filter(Boolean).join(' | ') || lastEmailError);
-  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), sendgrid: Boolean(sgKey && sgFromRaw), brevo: Boolean(brevoKey && brevoFromRaw), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
+  res.json({ configured: { gmail: Boolean(gmailUser && gmailPass), sendgrid: Boolean(sgKey && sgFromRaw), brevo: Boolean(brevoKey && brevoFromRaw), mailjet: Boolean(mjKey && mjSecret && mjFromRaw), resend: Boolean(resendKey) }, probes, httpsProbe, dbPing, results });
 });
 
 // Express Root Route: Redirect backend root GET / to Frontend Web App. When
